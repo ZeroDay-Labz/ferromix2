@@ -1,0 +1,19 @@
+[package]
+name = "mixer-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FerroMix headless daemon: owns the PipeWire graph, serves the GUI over a Unix socket"
+
+[[bin]]
+name = "ferromix-daemon"
+path = "src/main.rs"
+
+[dependencies]
+mixer-core = { path = "../mixer-core" }
+log = { workspace = true }
+env_logger = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+mixer-pw = { path = "../mixer-pw" }

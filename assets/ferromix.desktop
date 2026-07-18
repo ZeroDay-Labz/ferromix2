@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=FerroMix
+Comment=Virtual audio mixer for PipeWire
+Exec=ferromix-gui
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;

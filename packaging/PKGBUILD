@@ -1,0 +1,26 @@
+# Maintainer: you <you@example.com>
+pkgname=ferromix-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Voicemeeter-style virtual audio mixer for PipeWire"
+arch=('x86_64')
+url="https://github.com/yourname/ferromix"
+license=('MIT')
+depends=('pipewire')
+makedepends=('cargo' 'clang' 'pkgconf' 'git')
+source=("$pkgname::git+$url")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname"
+  cargo build --release --locked
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 target/release/ferromix-daemon "$pkgdir/usr/bin/ferromix-daemon"
+  install -Dm755 target/release/ferromix-gui "$pkgdir/usr/bin/ferromix-gui"
+  install -Dm644 packaging/ferromix.service "$pkgdir/usr/lib/systemd/user/ferromix.service"
+  install -Dm644 assets/ferromix.desktop "$pkgdir/usr/share/applications/ferromix.desktop"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,17 @@
+[package]
+name = "mixer-gui-iced"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FerroMix GUI (Iced): mixer console, routing matrix, settings"
+
+[[bin]]
+name = "ferromix"
+path = "src/main.rs"
+
+[dependencies]
+mixer-core = { path = "../mixer-core" }
+iced = { version = "0.13", features = ["canvas", "tokio", "advanced"] }
+log = { workspace = true }
+env_logger = { workspace = true }

@@ -1,0 +1,12 @@
+[Unit]
+Description=FerroMix virtual audio mixer daemon
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+
+[Service]
+ExecStart=/usr/local/bin/ferromix-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

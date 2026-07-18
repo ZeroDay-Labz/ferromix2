@@ -1,0 +1,15 @@
+[package]
+name = "mixer-pw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PipeWire backend for FerroMix (Linux only)"
+
+[dependencies]
+mixer-core = { path = "../mixer-core" }
+log = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "0.9"
+hound = { workspace = true }
