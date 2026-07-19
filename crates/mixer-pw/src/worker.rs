@@ -470,6 +470,10 @@ fn apply_bus_listeners(ctx: &Ctx) {
         let st = ctx.st.borrow();
         let mut v = Vec::new();
         for (bus, key) in st.bus_listener.iter() {
+            // A muted B-bus sends nothing — skip its listener link entirely.
+            if st.desired.bus_mute.get(bus).copied().unwrap_or(false) {
+                continue;
+            }
             let Some(&(bus_node, _)) = st.bus_nodes.get(bus) else { continue };
             for cap in resolve_capture(&st, key) {
                 v.push((*bus, bus_node, cap));
@@ -1110,10 +1114,45 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             }
         }
         PwCmd::SetBusMute { idx, mute } => {
-            let mut st = ctx.st.borrow_mut();
-            st.desired.bus_mute.insert(idx, mute);
-            if let Some((_, node)) = st.bus_nodes.get(&idx) {
-                let _ = virtual_dev::set_node_mute(node, mute);
+            {
+                let mut st = ctx.st.borrow_mut();
+                st.desired.bus_mute.insert(idx, mute);
+                if let Some((_, node)) = st.bus_nodes.get(&idx) {
+                    let _ = virtual_dev::set_node_mute(node, mute);
+                }
+            }
+            // A B-bus is a null-sink source; the mute flag alone doesn't stop
+            // its output reaching the app that captures it. Cut/restore the
+            // actual links so MUTE truly silences the virtual mic — muting B2
+            // must stop your voice reaching Discord.
+            if mute {
+                // Drop every listener + monitor link out of this bus.
+                let caps: Vec<NodeId> = ctx
+                    .st
+                    .borrow()
+                    .listener_links
+                    .keys()
+                    .filter(|(b, _)| *b == idx)
+                    .map(|(_, c)| *c)
+                    .collect();
+                for cap in caps {
+                    remove_slot_links(ctx, &Slot::BusListener(idx, cap));
+                }
+                let mons: Vec<usize> = ctx
+                    .st
+                    .borrow()
+                    .monitors
+                    .iter()
+                    .filter(|(b, _)| *b == idx)
+                    .map(|(_, a)| *a)
+                    .collect();
+                for a in mons {
+                    remove_slot_links(ctx, &Slot::Monitor(idx, a));
+                }
+            } else {
+                // Un-mute: reconcile rebuilds the wanted links.
+                apply_bus_listeners(ctx);
+                reconcile(ctx);
             }
         }
         PwCmd::SetBusMonitor { bus, a_bus, on } => {

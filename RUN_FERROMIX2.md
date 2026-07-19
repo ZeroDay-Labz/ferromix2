@@ -62,3 +62,18 @@ Everything is now wired and controllable:
 - MATRIX tab (grid view) + SETTINGS tab (recordings dir, feedback guard,
   UI scale, low-latency quantum = the Linux "ASIO" equivalent)
 - App icon
+
+## v2.2.0 — matrix + settings + bus-mute fix
+- MATRIX tab: full patch grid (strips × buses), click any cell to route.
+  Cyan = hardware, violet = virtual mic, ✕ = feedback blocked.
+- SETTINGS tab: feedback-guard toggle, recordings folder, the low-latency
+  quantum command (Linux "ASIO" equivalent), and a routing primer.
+- FIX: muting a B-bus now cuts its output links — muting B2 actually stops
+  your voice reaching Discord (was only setting a flag before).
+
+## Understanding the B-bus meter (not a bug)
+B2's meter rising when YOU speak is correct: a B-bus is a virtual MIC carrying
+what you SEND to the app. Discord's INCOMING call audio arrives on the WEBRTC
+*strip* — that strip's meter moves when someone talks in VC, and that strip -> A1
+is how you hear them. To stop hearing Discord, unroute the WEBRTC strip from A1;
+to stop Discord hearing you, mute B2.

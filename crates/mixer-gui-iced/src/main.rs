@@ -112,14 +112,8 @@ impl App {
         let header = self.header();
         let body: Element<Message> = match self.tab {
             Tab::Console => self.console(),
-            Tab::Matrix => container(text("matrix — coming in round 2").color(theme::TEXT_DIM))
-                .padding(40)
-                .into(),
-            Tab::Settings => {
-                container(text("settings — coming in round 2").color(theme::TEXT_DIM))
-                    .padding(40)
-                    .into()
-            }
+            Tab::Matrix => self.matrix(),
+            Tab::Settings => self.settings(),
         };
 
         container(column![header, body].spacing(0))
@@ -133,7 +127,7 @@ impl App {
         let logo = row![
             text("FERRO").size(20).color(theme::TEXT),
             text("MIX").size(20).color(theme::ACCENT),
-            text("2  v2.1").size(11).color(theme::TEXT_DIM),
+            text("2  v2.2").size(11).color(theme::TEXT_DIM),
         ]
         .align_y(iced::Alignment::Center);
 
@@ -218,5 +212,19 @@ impl App {
         .padding(16);
 
         scrollable(console).width(Length::Fill).height(Length::Fill).into()
+    }
+
+    fn matrix(&self) -> Element<Message> {
+        let Some(state) = &self.state else {
+            return container(text("waiting for daemon…").color(theme::TEXT_DIM)).padding(40).into();
+        };
+        widgets::matrix_view(state)
+    }
+
+    fn settings(&self) -> Element<Message> {
+        let Some(state) = &self.state else {
+            return container(text("waiting for daemon…").color(theme::TEXT_DIM)).padding(40).into();
+        };
+        widgets::settings_view(state)
     }
 }

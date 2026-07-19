@@ -4,7 +4,7 @@
 use crate::theme;
 use crate::Message;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
-use iced::widget::{button, column, container, mouse_area, pick_list, row, text, vertical_slider, Space};
+use iced::widget::{button, column, container, mouse_area, pick_list, row, scrollable, text, vertical_slider, Space};
 use iced::{Alignment, Border, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme};
 use mixer_core::engine::Command;
 use mixer_core::model::{pos_to_db, Bus, BusKind, MixerState, Strip, StripDsp};
@@ -202,4 +202,147 @@ pub fn hw_out_slot<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState) -> Eleme
         .padding([4, 8]).on_press(Message::Send(Command::SetBusMute { bus: idx, mute: !bus.mute }));
     container(row![text(&bus.label).size(14).color(theme::ACCENT), Space::with_width(8), dd, Space::with_width(6), mute].align_y(Alignment::Center))
         .padding(8).width(Length::Fixed(340.0)).style(theme::card).into()
+}
+
+// ─────────────────────────────────────────────────────── MATRIX
+
+/// The patch matrix: strips as rows, buses as columns, a toggle cell at each
+/// crossing. Cyan = hardware send, violet = virtual mic, coral = feedback.
+pub fn matrix_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
+    let mut grid = column![].spacing(6);
+
+    // Header row: bus labels.
+    let mut header = row![container(text("").width(Length::Fixed(150.0))).width(Length::Fixed(150.0))].spacing(6);
+    for bus in &state.buses {
+        let col = if bus.kind == BusKind::VirtualMic { theme::VIOLET } else { theme::ACCENT };
+        let tag = if bus.kind == BusKind::VirtualMic { "MIC" } else { "OUT" };
+        header = header.push(
+            container(column![text(&bus.label).size(12).color(col), text(tag).size(7).color(theme::TEXT_DIM)].align_x(Alignment::Center))
+                .width(Length::Fixed(54.0)).center_x(Length::Fixed(54.0)),
+        );
+    }
+    grid = grid.push(header);
+
+    for (si, strip) in state.strips.iter().enumerate() {
+        let name = strip.display_name(si);
+        let name_col = if !strip.input_live { theme::TEXT_DIM } else { theme::TEXT };
+        let mut r = row![
+            container(text(format!("{:02}  {}", si + 1, elide(&name, 16))).size(11).color(name_col))
+                .width(Length::Fixed(150.0))
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        for (bi, bus) in state.buses.iter().enumerate() {
+            let on = strip.assign.get(bi).copied().unwrap_or(false);
+            let fb = state.is_feedback(si, bi);
+            let is_b = bus.kind == BusKind::VirtualMic;
+            let accent = if is_b { theme::VIOLET } else { theme::ACCENT };
+            let (bg, mark) = if fb { (theme::DANGER, "✕") } else if on { (accent, "●") } else { (theme::SEG_OFF, "") };
+            let cell = button(text(mark).size(12).color(theme::BG_DEEP).center().width(Length::Fill))
+                .style(move |_t, _s| button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    border: Border { color: if on || fb { bg } else { theme::EDGE }, width: 1.0, radius: 6.0.into() },
+                    text_color: theme::BG_DEEP, ..Default::default()
+                })
+                .width(Length::Fixed(54.0)).height(Length::Fixed(30.0))
+                .on_press(Message::Send(Command::ToggleAssign { strip: si, bus: bi }));
+            r = r.push(cell);
+        }
+        grid = grid.push(r);
+    }
+
+    let head = column![
+        text("PATCH MATRIX").size(13).color(theme::TEXT),
+        text("rows send into columns · cyan = hardware out · violet = virtual mic · ✕ = feedback blocked").size(9).color(theme::TEXT_DIM),
+    ]
+    .spacing(4);
+
+    container(column![head, Space::with_height(16), grid].spacing(0).padding(20))
+        .width(Length::Fill).into()
+}
+
+// ─────────────────────────────────────────────────────── SETTINGS
+
+pub fn settings_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
+    let section = |title: &'a str| text(title).size(11).color(theme::ACCENT);
+
+    // Feedback guard toggle.
+    let guard = state.feedback_guard;
+    let guard_btn = wide_button(
+        if guard { "FEEDBACK GUARD: ON" } else { "FEEDBACK GUARD: OFF" },
+        guard,
+        theme::ACCENT,
+        Message::Send(Command::SetFeedbackGuard { on: !guard }),
+    );
+
+    let card = |content: Element<'a, Message>| {
+        container(content).padding(16).width(Length::Fixed(520.0)).style(theme::card)
+    };
+
+    let routing = card(
+        column![
+            section("ROUTING"),
+            Space::with_height(8),
+            container(guard_btn).width(Length::Fixed(260.0)),
+            Space::with_height(6),
+            text("Blocks a strip from sending into a virtual mic its own app captures — prevents echo loops. Leave ON unless you know what you're doing.").size(9).color(theme::TEXT_DIM),
+        ]
+        .spacing(0)
+        .into(),
+    );
+
+    let rec = card(
+        column![
+            section("RECORDING"),
+            Space::with_height(8),
+            text(format!("Recordings folder:  {}", state.recordings_dir)).size(10).color(theme::TEXT),
+            Space::with_height(4),
+            text("Each armed track writes its own WAV. Arm tracks from the record strip on the console.").size(9).color(theme::TEXT_DIM),
+        ]
+        .spacing(0)
+        .into(),
+    );
+
+    let latency = card(
+        column![
+            section("LATENCY (the Linux \"ASIO\")"),
+            Space::with_height(8),
+            text("FerroMix2 runs on PipeWire — no ASIO driver needed. For low-latency, set a small quantum globally:").size(9).color(theme::TEXT_DIM),
+            Space::with_height(6),
+            container(text("pw-metadata -n settings 0 clock.force-quantum 256").size(10).color(theme::ACCENT))
+                .padding(8).style(|_t| iced::widget::container::Style { background: Some(iced::Background::Color(theme::BG_DEEP)), border: Border { color: theme::EDGE, width: 1.0, radius: 4.0.into() }, ..Default::default() }),
+            Space::with_height(4),
+            text("256 samples @ 48kHz ≈ 5ms. Lower = tighter but more CPU. Reset with clock.force-quantum 0.").size(9).color(theme::TEXT_DIM),
+        ]
+        .spacing(0)
+        .into(),
+    );
+
+    let about = card(
+        column![
+            section("ABOUT"),
+            Space::with_height(8),
+            text("FerroMix2 — an open-source Voicemeeter-class mixer for Linux / PipeWire.").size(10).color(theme::TEXT),
+            text("Every strip receives one source. A-buses you hear; B-buses are virtual mics apps read. MUTE cuts a strip everywhere.").size(9).color(theme::TEXT_DIM),
+        ]
+        .spacing(0)
+        .into(),
+    );
+
+    scrollable(
+        column![
+            text("SETTINGS").size(14).color(theme::TEXT),
+            Space::with_height(16),
+            routing,
+            Space::with_height(12),
+            rec,
+            Space::with_height(12),
+            latency,
+            Space::with_height(12),
+            about,
+        ]
+        .spacing(0)
+        .padding(20),
+    )
+    .into()
 }
