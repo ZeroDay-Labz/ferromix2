@@ -16,7 +16,7 @@ use std::sync::Mutex;
 fn main() -> iced::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     log::info!("FerroMix Iced console starting");
-    iced::application("FerroMix", App::update, App::view)
+    iced::application("FerroMix2", App::update, App::view)
         .subscription(App::subscription)
         .theme(|_| theme::base())
         .window_size((1620.0, 780.0))
@@ -133,7 +133,7 @@ impl App {
         let logo = row![
             text("FERRO").size(20).color(theme::TEXT),
             text("MIX").size(20).color(theme::ACCENT),
-            text(" v1.6").size(11).color(theme::TEXT_DIM),
+            text("2  v2.1").size(11).color(theme::TEXT_DIM),
         ]
         .align_y(iced::Alignment::Center);
 
@@ -177,6 +177,16 @@ impl App {
                 .into();
         };
 
+        // Hardware-out row: A1/A2/A3 device slots across the top.
+        let mut hw = row![text("HARDWARE OUT").size(10).color(theme::TEXT_DIM)]
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
+        for (i, b) in state.buses.iter().enumerate() {
+            if b.kind == BusKind::HwOutput {
+                hw = hw.push(widgets::hw_out_slot(i, b, state));
+            }
+        }
+
         // Input strips (sources).
         let mut strips = row![].spacing(10);
         for (i, s) in state.strips.iter().enumerate() {
@@ -198,6 +208,8 @@ impl App {
         ];
 
         let console = column![
+            hw,
+            Space::with_height(14),
             labels,
             Space::with_height(6),
             row![strips, Space::with_width(20), buses].spacing(0),

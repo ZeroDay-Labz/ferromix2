@@ -119,6 +119,43 @@ pub struct Strip {
     pub assign: Vec<bool>,
     #[serde(default)]
     pub recording: bool,
+    /// Per-strip DSP. Off by default; each strip owns its own gate + compressor.
+    #[serde(default)]
+    pub dsp: StripDsp,
+}
+
+/// Per-strip signal processing. A downward noise gate followed by a soft-knee
+/// compressor, each with a single "amount" knob mapped to sensible internal
+/// parameters — so the UI stays two dials, not twenty.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct StripDsp {
+    pub gate_on: bool,
+    /// 0.0 = fully open (no gating), 1.0 = aggressive. Maps to threshold.
+    pub gate: f32,
+    pub comp_on: bool,
+    /// 0.0 = none, 1.0 = heavy. Maps to threshold + ratio together.
+    pub comp: f32,
+}
+
+impl Default for StripDsp {
+    fn default() -> Self {
+        StripDsp { gate_on: false, gate: 0.3, comp_on: false, comp: 0.4 }
+    }
+}
+
+impl StripDsp {
+    /// Gate open threshold in dB, from the knob (0..1 → -60..-20 dB).
+    pub fn gate_threshold_db(&self) -> f32 {
+        -60.0 + self.gate.clamp(0.0, 1.0) * 40.0
+    }
+    /// Compressor threshold in dB (0..1 → -6..-30 dB, more knob = lower).
+    pub fn comp_threshold_db(&self) -> f32 {
+        -6.0 - self.comp.clamp(0.0, 1.0) * 24.0
+    }
+    /// Compressor ratio (0..1 → 1.5:1 .. 8:1).
+    pub fn comp_ratio(&self) -> f32 {
+        1.5 + self.comp.clamp(0.0, 1.0) * 6.5
+    }
 }
 
 impl Strip {
@@ -145,6 +182,7 @@ impl Strip {
             level: Level::default(),
             assign: vec![false; n_buses],
             recording: false,
+            dsp: StripDsp::default(),
         }
     }
 }

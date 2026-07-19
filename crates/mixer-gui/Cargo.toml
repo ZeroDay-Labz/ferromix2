@@ -7,7 +7,7 @@ authors.workspace = true
 description = "FerroMix GUI (egui): mixer console, routing matrix, status ticker"
 
 [[bin]]
-name = "ferromix-gui"
+name = "ferromix2-gui"
 path = "src/main.rs"
 
 [dependencies]

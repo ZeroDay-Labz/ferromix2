@@ -7,7 +7,7 @@ authors.workspace = true
 description = "FerroMix headless daemon: owns the PipeWire graph, serves the GUI over a Unix socket"
 
 [[bin]]
-name = "ferromix-daemon"
+name = "ferromix2-daemon"
 path = "src/main.rs"
 
 [dependencies]

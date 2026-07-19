@@ -28,9 +28,9 @@ pub enum Response {
 
 pub fn socket_path() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return std::path::PathBuf::from(dir).join("ferromix.sock");
+        return std::path::PathBuf::from(dir).join("ferromix2.sock");
     }
-    std::env::temp_dir().join(format!("ferromix-{}.sock", uid()))
+    std::env::temp_dir().join(format!("ferromix2-{}.sock", uid()))
 }
 
 fn uid() -> u32 {

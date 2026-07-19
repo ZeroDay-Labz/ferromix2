@@ -122,11 +122,11 @@ impl BusCfg {
 
 impl Config {
     pub fn path() -> PathBuf {
-        dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("ferromix").join("config.toml")
+        dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("ferromix2").join("config.toml")
     }
     pub fn recordings_dir(&self) -> PathBuf {
         self.recordings_dir.clone().unwrap_or_else(|| {
-            dirs::audio_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("ferromix")
+            dirs::audio_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("ferromix2")
         })
     }
     /// Make sure every bus we ship exists, even in a config written by an older

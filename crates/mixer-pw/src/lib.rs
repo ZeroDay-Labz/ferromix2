@@ -14,6 +14,7 @@ mod recorder;
 mod registry;
 mod tap;
 mod virtual_dev;
+mod dsp;
 mod worker;
 
 use mixer_core::backend::{AudioBackend, BackendEvent, BackendResult};

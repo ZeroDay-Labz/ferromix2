@@ -16,6 +16,7 @@ pub enum Command {
     ToggleAssign { strip: usize, bus: usize },
     SetStripVolume { strip: usize, volume: f32 },
     SetStripMute { strip: usize, mute: bool },
+    SetStripDsp { strip: usize, dsp: crate::model::StripDsp },
     SetBusVolume { bus: usize, volume: f32 },
     SetBusMute { bus: usize, mute: bool },
     SetBusDevice { bus: usize, device: Option<String> },
@@ -124,6 +125,7 @@ fn initial_state(cfg: &Config) -> MixerState {
                 level: Level::default(),
                 assign,
                 recording: false,
+                dsp: crate::model::StripDsp::default(),
             }
         })
         .collect();
@@ -358,6 +360,13 @@ fn run(
                         s.volume = v;
                     }
                     let _ = backend.set_strip_volume(strip, v);
+                }
+                Command::SetStripDsp { strip, dsp } => {
+                    if let Some(s) = st.strips.get_mut(strip) {
+                        s.dsp = dsp;
+                    }
+                    // Backend DSP application is wired in the next round; the
+                    // value is persisted and reflected in the UI now.
                 }
                 Command::SetStripMute { strip, mute } => {
                     if let Some(s) = st.strips.get_mut(strip) {

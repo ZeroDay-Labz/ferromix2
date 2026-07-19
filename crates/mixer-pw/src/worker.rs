@@ -37,6 +37,13 @@ enum Slot {
     Send(usize, usize),
     /// bus monitor -> hardware sink
     BusDev(usize),
+    /// B-bus output -> an app's capture (mic) input. We draw this link
+    /// OURSELVES instead of asking WirePlumber via target.object, because the
+    /// B-bus is created with node.autoconnect=false — WirePlumber refuses to
+    /// route a node it's told to leave alone, which stranded the app's mic and
+    /// let it fall back to grabbing the raw default source. Drawing the link
+    /// directly sidesteps WirePlumber entirely.
+    BusListener(usize, NodeId),
 }
 
 #[derive(Default)]
@@ -86,6 +93,9 @@ struct WorkerState {
     bus_listener: HashMap<usize, String>,
     /// capture node -> bus name we already pointed it at.
     capture_targets: HashMap<NodeId, String>,
+    /// (bus idx, capture node) -> unit, tracking B-bus→app-mic links we drew
+    /// ourselves so we can tear them down when the assignment changes.
+    listener_links: HashMap<(usize, NodeId), ()>,
     last_capture_apps: Vec<SourceInfo>,
     last_sources: Vec<SourceInfo>,
     last_devices: Vec<Device>,
@@ -452,26 +462,44 @@ fn resolve_capture(st: &WorkerState, key: &str) -> Vec<NodeId> {
 /// set Discord's mic to B1 from inside FerroMix instead of digging through
 /// Discord's own settings.
 fn apply_bus_listeners(ctx: &Ctx) {
-    let work: Vec<(NodeId, String)> = {
+    // Draw B-bus -> app-capture links ourselves. WirePlumber won't route into a
+    // node marked node.autoconnect=false, so target.object silently failed and
+    // the app's mic fell back to the default source (the Spotify+mic bleed).
+    // Collect the desired (bus_node, capture_node) pairs.
+    let desired: Vec<(usize, NodeId, NodeId)> = {
         let st = ctx.st.borrow();
         let mut v = Vec::new();
         for (bus, key) in st.bus_listener.iter() {
-            let name = virtual_dev::bus_node_name(*bus);
-            for n in resolve_capture(&st, key) {
-                if st.capture_targets.get(&n) != Some(&name) {
-                    v.push((n, name.clone()));
-                }
+            let Some(&(bus_node, _)) = st.bus_nodes.get(bus) else { continue };
+            for cap in resolve_capture(&st, key) {
+                v.push((*bus, bus_node, cap));
             }
         }
         v
     };
-    for (node, target) in work {
-        let mut st = ctx.st.borrow_mut();
-        st.capture_targets.insert(node, target.clone());
-        if let Some(md) = st.metadata.as_ref() {
-            let json = format!("\"{target}\"");
-            md.set_property(node, "target.object", Some("Spa:String:JSON"), Some(&json));
-            log::info!("MIC TARGET {} -> {}", nname(&st, node), target);
+
+    // Remove any stale listener links whose app is no longer assigned.
+    let stale: Vec<(usize, NodeId)> = {
+        let st = ctx.st.borrow();
+        st.listener_links
+            .keys()
+            .copied()
+            .filter(|(bus, cap)| !desired.iter().any(|(b, _, c)| b == bus && c == cap))
+            .collect()
+    };
+    for (bus, cap) in stale {
+        remove_slot_links(ctx, &Slot::BusListener(bus, cap));
+        ctx.st.borrow_mut().listener_links.remove(&(bus, cap));
+    }
+
+    // Ensure the wanted links exist.
+    for (bus, bus_node, cap) in desired {
+        let already = ctx.st.borrow().listener_links.contains_key(&(bus, cap));
+        if !already {
+            let mut st = ctx.st.borrow_mut();
+            ensure_links(&ctx.core, &mut st, Slot::BusListener(bus, cap), bus_node, cap);
+            st.listener_links.insert((bus, cap), ());
+            log::info!("MIC LINK bus.{bus} -> {}", nname(&st, cap));
         }
     }
 }
@@ -946,6 +974,9 @@ fn remove_slot_links(ctx: &Ctx, slot: &Slot) {
                 (Some(s), Some(d)) => Some((vec![s], d)),
                 _ => None,
             }
+        }
+        Slot::BusListener(bus, cap) => {
+            st.bus_nodes.get(bus).map(|(id, _)| *id).map(|bus_node| (vec![bus_node], *cap))
         }
         Slot::BusDev(_) => None,
     };

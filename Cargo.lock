@@ -159,9 +159,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.103"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "approx"
@@ -2705,7 +2705,7 @@ dependencies = [
 
 [[package]]
 name = "mixer-core"
-version = "1.6.0"
+version = "2.1.0"
 dependencies = [
  "bincode",
  "dirs 5.0.1",
@@ -2716,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "mixer-daemon"
-version = "1.6.0"
+version = "2.1.0"
 dependencies = [
  "env_logger",
  "log",
@@ -2726,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "mixer-gui"
-version = "1.6.0"
+version = "2.1.0"
 dependencies = [
  "eframe",
  "env_logger",
@@ -2736,7 +2736,7 @@ dependencies = [
 
 [[package]]
 name = "mixer-gui-iced"
-version = "1.6.0"
+version = "2.1.0"
 dependencies = [
  "env_logger",
  "iced",
@@ -2746,7 +2746,7 @@ dependencies = [
 
 [[package]]
 name = "mixer-pw"
-version = "1.6.0"
+version = "2.1.0"
 dependencies = [
  "hound",
  "log",
