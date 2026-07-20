@@ -127,7 +127,7 @@ impl App {
         let logo = row![
             text("FERRO").size(20).color(theme::TEXT),
             text("MIX").size(20).color(theme::ACCENT),
-            text("2  v2.2").size(11).color(theme::TEXT_DIM),
+            text("2  v2.4").size(11).color(theme::TEXT_DIM),
         ]
         .align_y(iced::Alignment::Center);
 

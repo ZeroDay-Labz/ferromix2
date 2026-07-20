@@ -77,3 +77,30 @@ what you SEND to the app. Discord's INCOMING call audio arrives on the WEBRTC
 *strip* — that strip's meter moves when someone talks in VC, and that strip -> A1
 is how you hear them. To stop hearing Discord, unroute the WEBRTC strip from A1;
 to stop Discord hearing you, mute B2.
+
+## v2.3.0 — interaction + a diagnostic
+- Knobs now: click+drag vertically to set, scroll to fine-tune, right-click resets.
+  New look: gradient glow ring + tick marks.
+- Faders: scroll to nudge, right-click snaps back to 0.0 dB (unity).
+- Added trace_strip.sh — run it WHILE an app plays audio; it proves whether
+  the app's output is reaching its FerroMix strip. THIS is how we fix the
+  "meter doesn't move" issue for real.
+
+## Diagnosing "app audio doesn't reach the strip"
+For a strip to show an app's audio, the app's OUTPUT must point at that strip's
+sink (named "FerroMix Input N") — exactly like Voicemeeter needs the app's
+output set to "Voicemeeter Input". FerroMix also tries to pull apps assigned via
+the dropdown. To see where the break is, run ./trace_strip.sh while audio plays
+and paste the output.
+
+## v2.4.0 — SET AS DEFAULT (the fix for "app audio doesn't reach the strip")
+The Iced GUI was missing the default-device buttons. Now:
+- Every strip has "SET AS DEFAULT" — makes it the system default OUTPUT. Any app
+  on "default" (Spotify, etc.) then flows into that strip automatically. THIS is
+  why Spotify's meter wasn't moving — it was on default with nowhere to route.
+- Every B bus has "SET AS DEF MIC" — makes it the system default INPUT.
+
+### To get Spotify (or any "default" app) onto a strip, either:
+  A) Set the app's OUTPUT to "FerroMix Input N" in the app/KDE audio settings, OR
+  B) Click SET AS DEFAULT on the strip you want desktop audio on — then every
+     default app lands there automatically.

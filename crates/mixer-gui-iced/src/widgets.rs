@@ -40,15 +40,17 @@ fn wide_button<'a>(label: &'a str, on: bool, accent: Color, msg: Message) -> Ele
         .width(Length::Fill).padding([6, 0]).on_press(msg).into()
 }
 
-fn fader<'a>(value: f32, accent: Color, on_change: impl Fn(f32) -> Message + 'a + Copy) -> Element<'a, Message> {
+fn fader<'a>(value: f32, accent: Color, unity: f32, on_change: impl Fn(f32) -> Message + 'a + Copy) -> Element<'a, Message> {
     let slider = vertical_slider(0.0..=1.0, value, move |v| on_change(v))
         .step(0.001).height(Length::Fixed(FADER_H))
         .style(move |_t, _s| slider_style(accent));
+    // Scroll to nudge; right-click to snap back to unity (0.0 dB).
     mouse_area(slider)
         .on_scroll(move |delta| {
             let dy = match delta { iced::mouse::ScrollDelta::Lines { y, .. } => y, iced::mouse::ScrollDelta::Pixels { y, .. } => y / 40.0 };
             on_change((value + dy * 0.02).clamp(0.0, 1.0))
         })
+        .on_right_press(on_change(unity))
         .into()
 }
 
@@ -74,39 +76,110 @@ fn elide(s: &str, max: usize) -> String {
 }
 
 fn knob<'a>(label: &'a str, value: f32, on: bool, accent: Color, strip: usize, dsp: StripDsp, is_gate: bool) -> Element<'a, Message> {
-    let dial = Canvas::new(Dial { value, on, accent }).width(Length::Fixed(44.0)).height(Length::Fixed(44.0));
-    let dial_area = mouse_area(dial).on_scroll(move |d| {
-        let dy = match d { iced::mouse::ScrollDelta::Lines { y, .. } => y, iced::mouse::ScrollDelta::Pixels { y, .. } => y / 40.0 };
-        let nv = (value + dy * 0.05).clamp(0.0, 1.0);
-        let ndsp = if is_gate { StripDsp { gate: nv, ..dsp } } else { StripDsp { comp: nv, ..dsp } };
-        Message::Send(Command::SetStripDsp { strip, dsp: ndsp })
-    });
+    let dial = Canvas::new(Dial { value, on, accent, strip, dsp, is_gate })
+        .width(Length::Fixed(48.0))
+        .height(Length::Fixed(48.0));
     let toggle = { let ndsp = if is_gate { StripDsp { gate_on: !dsp.gate_on, ..dsp } } else { StripDsp { comp_on: !dsp.comp_on, ..dsp } }; Message::Send(Command::SetStripDsp { strip, dsp: ndsp }) };
     let lbl = button(text(label).size(9).color(if on { accent } else { theme::TEXT_DIM }).center().width(Length::Fill))
         .style(move |_t, _s| button::Style { background: Some(iced::Background::Color(if on { theme::with_alpha(accent, 0.15) } else { theme::SEG_OFF })), border: Border { color: if on { accent } else { theme::EDGE }, width: 1.0, radius: 4.0.into() }, text_color: if on { accent } else { theme::TEXT_DIM }, ..Default::default() })
         .width(Length::Fixed(48.0)).padding([2, 0]).on_press(toggle);
-    column![dial_area, lbl].spacing(2).align_x(Alignment::Center).into()
+    column![dial, lbl].spacing(3).align_x(Alignment::Center).into()
 }
 
-struct Dial { value: f32, on: bool, accent: Color }
-impl<M> canvas::Program<M> for Dial {
-    type State = ();
-    fn draw(&self, _s: &(), r: &Renderer, _t: &Theme, b: Rectangle, _c: iced::mouse::Cursor) -> Vec<Geometry> {
+/// Interactive DSP knob. Click+drag vertically to set the amount, scroll to
+/// fine-tune. Renders a glowing gradient ring with tick marks.
+struct Dial { value: f32, on: bool, accent: Color, strip: usize, dsp: StripDsp, is_gate: bool }
+
+impl Dial {
+    fn emit(&self, nv: f32) -> Message {
+        let nv = nv.clamp(0.0, 1.0);
+        let ndsp = if self.is_gate { StripDsp { gate: nv, ..self.dsp } } else { StripDsp { comp: nv, ..self.dsp } };
+        Message::Send(Command::SetStripDsp { strip: self.strip, dsp: ndsp })
+    }
+}
+
+impl canvas::Program<Message> for Dial {
+    type State = Option<f32>; // drag anchor: cursor-y at press
+
+    fn update(&self, state: &mut Self::State, event: canvas::Event, bounds: Rectangle, cursor: iced::mouse::Cursor) -> (canvas::event::Status, Option<Message>) {
+        use canvas::event::{self, Event};
+        use iced::mouse::{self, Button};
+        let inside = cursor.is_over(bounds);
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(Button::Left)) if inside => {
+                *state = cursor.position().map(|p| p.y);
+                (event::Status::Captured, None)
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if let (Some(anchor), Some(pos)) = (*state, cursor.position()) {
+                    // Drag up = increase. 120px of travel = full range.
+                    let delta = (anchor - pos.y) / 120.0;
+                    *state = Some(pos.y);
+                    return (event::Status::Captured, Some(self.emit(self.value + delta)));
+                }
+                (event::Status::Ignored, None)
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(Button::Left)) => {
+                *state = None;
+                (event::Status::Ignored, None)
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) if inside => {
+                let dy = match delta { mouse::ScrollDelta::Lines { y, .. } => y, mouse::ScrollDelta::Pixels { y, .. } => y / 40.0 };
+                (event::Status::Captured, Some(self.emit(self.value + dy * 0.05)))
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(Button::Right)) if inside => {
+                // Right-click resets to default amount.
+                (event::Status::Captured, Some(self.emit(0.4)))
+            }
+            _ => (event::Status::Ignored, None),
+        }
+    }
+
+    fn draw(&self, _s: &Self::State, r: &Renderer, _t: &Theme, b: Rectangle, _c: iced::mouse::Cursor) -> Vec<Geometry> {
         use std::f32::consts::PI;
         let mut f = Frame::new(r, b.size());
         let c = Point::new(b.width / 2.0, b.height / 2.0);
-        let rad = b.width / 2.0 - 5.0; let start = PI * 0.75; let sweep = PI * 1.5;
-        let dim = theme::with_alpha(self.accent, if self.on { 0.25 } else { 0.12 });
-        let track = Path::new(|p| { p.arc(canvas::path::Arc { center: c, radius: rad, start_angle: iced::Radians(start), end_angle: iced::Radians(start + sweep) }); });
-        f.stroke(&track, Stroke::default().with_color(dim).with_width(4.0));
+        let rad = b.width / 2.0 - 6.0;
+        let start = PI * 0.75;
+        let sweep = PI * 1.5;
+
+        // Tick marks around the dial.
+        for i in 0..=10 {
+            let a = start + sweep * (i as f32 / 10.0);
+            let (i0, i1) = (rad + 1.0, rad + 4.0);
+            f.stroke(
+                &Path::line(Point::new(c.x + i0 * a.cos(), c.y + i0 * a.sin()), Point::new(c.x + i1 * a.cos(), c.y + i1 * a.sin())),
+                Stroke::default().with_color(theme::with_alpha(theme::EDGE, 0.8)).with_width(1.0),
+            );
+        }
+
+        // Track.
+        let dim = theme::with_alpha(self.accent, if self.on { 0.22 } else { 0.10 });
+        f.stroke(
+            &Path::new(|p| { p.arc(canvas::path::Arc { center: c, radius: rad, start_angle: iced::Radians(start), end_angle: iced::Radians(start + sweep) }); }),
+            Stroke::default().with_color(dim).with_width(5.0),
+        );
+
         if self.on {
             let v = self.value.clamp(0.0, 1.0);
-            let val = Path::new(|p| { p.arc(canvas::path::Arc { center: c, radius: rad, start_angle: iced::Radians(start), end_angle: iced::Radians(start + sweep * v) }); });
-            f.stroke(&val, Stroke::default().with_color(self.accent).with_width(4.0));
+            // Glow underlay.
+            f.stroke(
+                &Path::new(|p| { p.arc(canvas::path::Arc { center: c, radius: rad, start_angle: iced::Radians(start), end_angle: iced::Radians(start + sweep * v) }); }),
+                Stroke::default().with_color(theme::with_alpha(self.accent, 0.35)).with_width(9.0),
+            );
+            // Bright value arc.
+            f.stroke(
+                &Path::new(|p| { p.arc(canvas::path::Arc { center: c, radius: rad, start_angle: iced::Radians(start), end_angle: iced::Radians(start + sweep * v) }); }),
+                Stroke::default().with_color(self.accent).with_width(5.0),
+            );
+            // Pointer dot.
             let ang = start + sweep * v;
-            f.fill(&Path::circle(Point::new(c.x + rad * ang.cos(), c.y + rad * ang.sin()), 3.0), self.accent);
+            f.fill(&Path::circle(Point::new(c.x + rad * ang.cos(), c.y + rad * ang.sin()), 3.5), theme::TEXT);
         }
-        f.fill(&Path::circle(c, rad * 0.42), theme::PANEL_HI);
+
+        // Hub with a subtle bevel.
+        f.fill(&Path::circle(c, rad * 0.5), theme::PANEL_HI);
+        f.stroke(&Path::circle(c, rad * 0.5), Stroke::default().with_color(theme::with_alpha(self.accent, if self.on { 0.5 } else { 0.2 })).with_width(1.0));
         vec![f.into_geometry()]
     }
 }
@@ -152,7 +225,7 @@ pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState) -> El
     let sel = strip.input.as_ref().and_then(|k| opts.iter().find(|o| &o.key == k).cloned());
     let input_dd = dropdown("— select source —", opts, sel, move |o: Opt| Message::Send(Command::SetStripInput { strip: idx, input: Some(o.key) }));
     let meter = Canvas::new(Meter { level: strip.level.peak(), accent }).width(Length::Fixed(20.0)).height(Length::Fixed(FADER_H));
-    let fad = fader(strip.volume, accent, move |v| Message::Send(Command::SetStripVolume { strip: idx, volume: v }));
+    let fad = fader(strip.volume, accent, mixer_core::model::UNITY_POS, move |v| Message::Send(Command::SetStripVolume { strip: idx, volume: v }));
     let fader_row = row![meter, Space::with_width(4), fad, Space::with_width(8), text(fmt_db(strip.volume)).size(11).color(theme::TEXT)].align_y(Alignment::Center);
     let mut a_row = row![].spacing(3); let mut b_row = row![].spacing(3);
     for (bi, bus) in state.buses.iter().enumerate() {
@@ -165,7 +238,17 @@ pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState) -> El
     let dsp = strip.dsp;
     let knobs = row![knob("GATE", dsp.gate, dsp.gate_on, theme::ACCENT, idx, dsp, true), Space::with_width(6), knob("COMP", dsp.comp, dsp.comp_on, theme::VIOLET, idx, dsp, false)];
     let mute = wide_button("MUTE", strip.mute, theme::REC_RED, Message::Send(Command::SetStripMute { strip: idx, mute: !strip.mute }));
-    let body = column![head, Space::with_height(5), input_dd, Space::with_height(8), fader_row, Space::with_height(8), column![a_row, b_row].spacing(3), Space::with_height(8), knobs, Space::with_height(8), mute]
+    // SET AS DEFAULT: make this strip the system default output, so any app on
+    // "default" (e.g. Spotify) flows into it automatically. This is how you get
+    // "all my desktop audio through one strip" without configuring each app.
+    let is_default = state.default_output == Some(idx);
+    let default_btn = wide_button(
+        if is_default { "★ SYSTEM DEFAULT" } else { "SET AS DEFAULT" },
+        is_default,
+        theme::MIC_AMBER,
+        Message::Send(Command::SetDefaultOutput { strip: idx }),
+    );
+    let body = column![head, Space::with_height(5), input_dd, Space::with_height(8), fader_row, Space::with_height(8), column![a_row, b_row].spacing(3), Space::with_height(8), knobs, Space::with_height(8), mute, Space::with_height(4), default_btn]
         .spacing(0).width(Length::Fixed(STRIP_W));
     container(body).padding(10).width(Length::Fixed(STRIP_W + 20.0)).style(theme::card_accent(if strip.input_live { accent } else { theme::EDGE_SOFT })).into()
 }
@@ -179,7 +262,7 @@ pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState) -> Element<
     let app_dd = dropdown("◇ SEND TO APP", opts, sel, move |o: Opt| Message::Send(Command::SetBusListener { bus: idx, app: Some(o.key) }));
     let listening = if bus.listeners.is_empty() { text("no app assigned").size(9).color(theme::TEXT_DIM) } else { text(format!("◂ {} listening", elide(&bus.listeners[0], 12))).size(9).color(accent) };
     let meter = Canvas::new(Meter { level: bus.level.peak(), accent }).width(Length::Fixed(20.0)).height(Length::Fixed(FADER_H));
-    let fad = fader(bus.volume, accent, move |v| Message::Send(Command::SetBusVolume { bus: idx, volume: v }));
+    let fad = fader(bus.volume, accent, mixer_core::model::UNITY_POS, move |v| Message::Send(Command::SetBusVolume { bus: idx, volume: v }));
     let fader_row = row![meter, Space::with_width(4), fad, Space::with_width(8), text(fmt_db(bus.volume)).size(11).color(theme::TEXT)].align_y(Alignment::Center);
     let mut mon = row![].spacing(3);
     let a_buses: Vec<(usize, &Bus)> = state.buses.iter().enumerate().filter(|(_, b)| b.kind == BusKind::HwOutput).collect();
@@ -188,7 +271,16 @@ pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState) -> Element<
         mon = mon.push(send_pill(&ab.label, on, false, false, Message::Send(Command::ToggleBusMonitor { bus: idx, a_bus: ai })));
     }
     let mute = wide_button("MUTE", bus.mute, theme::REC_RED, Message::Send(Command::SetBusMute { bus: idx, mute: !bus.mute }));
-    let body = column![head, Space::with_height(5), app_dd, Space::with_height(3), listening, Space::with_height(6), fader_row, Space::with_height(8), text("MONITOR ON").size(8).color(theme::TEXT_DIM), Space::with_height(2), mon, Space::with_height(8), mute]
+    // SET AS DEF MIC: make this virtual mic the system default input, so apps
+    // on "default" microphone (e.g. browsers) transmit this bus's mix.
+    let is_def_mic = state.default_input == Some(idx);
+    let def_mic_btn = wide_button(
+        if is_def_mic { "★ DEFAULT MIC" } else { "SET AS DEF MIC" },
+        is_def_mic,
+        theme::MIC_AMBER,
+        Message::Send(Command::SetDefaultInput { bus: idx }),
+    );
+    let body = column![head, Space::with_height(5), app_dd, Space::with_height(3), listening, Space::with_height(6), fader_row, Space::with_height(8), text("MONITOR ON").size(8).color(theme::TEXT_DIM), Space::with_height(2), mon, Space::with_height(8), mute, Space::with_height(4), def_mic_btn]
         .spacing(0).width(Length::Fixed(STRIP_W));
     container(body).padding(10).width(Length::Fixed(STRIP_W + 20.0)).style(theme::card_accent(accent)).into()
 }
