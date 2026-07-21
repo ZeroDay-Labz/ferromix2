@@ -12,6 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 mixer-core = { path = "../mixer-core" }
-iced = { version = "0.13", features = ["canvas", "tokio", "advanced"] }
+iced = { version = "0.13", features = ["canvas", "svg", "tokio", "advanced"] }
 log = { workspace = true }
 env_logger = { workspace = true }

@@ -8,6 +8,7 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/mixer-gui/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/mixer-pw/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/mixer-core/examples" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

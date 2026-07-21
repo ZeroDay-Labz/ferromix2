@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#35e2d8"/>
+      <stop offset="100%" stop-color="#b46cff"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="256" height="256" rx="52" fill="#0b0e1a"/>
+  <rect x="0.5" y="0.5" width="255" height="255" rx="51.5" fill="none" stroke="#2a3250" stroke-width="1"/>
+
+  <!-- Three fader strips at different levels, reading as both a mixer and an "M". -->
+  <g stroke-linecap="round">
+    <line x1="76" y1="176" x2="76" y2="72" stroke="#232a44" stroke-width="14"/>
+    <line x1="128" y1="184" x2="128" y2="56" stroke="#232a44" stroke-width="14"/>
+    <line x1="180" y1="176" x2="180" y2="88" stroke="#232a44" stroke-width="14"/>
+
+    <line x1="76" y1="176" x2="76" y2="112" stroke="url(#accent)" stroke-width="14"/>
+    <line x1="128" y1="184" x2="128" y2="96" stroke="url(#accent)" stroke-width="14"/>
+    <line x1="180" y1="176" x2="180" y2="132" stroke="url(#accent)" stroke-width="14"/>
+
+    <circle cx="76" cy="112" r="13" fill="#0b0e1a" stroke="#35e2d8" stroke-width="4"/>
+    <circle cx="128" cy="96" r="13" fill="#0b0e1a" stroke="#8b6cff" stroke-width="4"/>
+    <circle cx="180" cy="132" r="13" fill="#0b0e1a" stroke="#b46cff" stroke-width="4"/>
+  </g>
+</svg>

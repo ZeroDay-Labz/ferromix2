@@ -143,6 +143,7 @@ fn initial_state(cfg: &Config) -> MixerState {
         feedback_guard: cfg.feedback_guard,
         default_output: None,
         default_input: None,
+        ui_scale: cfg.ui_scale,
         log: Vec::new(),
     }
 }
@@ -365,8 +366,7 @@ fn run(
                     if let Some(s) = st.strips.get_mut(strip) {
                         s.dsp = dsp;
                     }
-                    // Backend DSP application is wired in the next round; the
-                    // value is persisted and reflected in the UI now.
+                    let _ = backend.set_strip_dsp(strip, dsp);
                 }
                 Command::SetStripMute { strip, mute } => {
                     if let Some(s) = st.strips.get_mut(strip) {
@@ -483,6 +483,7 @@ fn run(
                 }
                 Command::SetUiScale { scale } => {
                     config.ui_scale = scale.clamp(0.5, 3.0);
+                    st.ui_scale = config.ui_scale;
                     let _ = config.save();
                 }
                 Command::SetDefaultOutput { strip } => {

@@ -29,7 +29,9 @@ If the window doesn't appear on KDE Wayland:
 - Fader drag, device dropdowns, SEND TO APP, matrix, settings: round 2 UI work.
 
 ## Notes
-- The old egui GUI (ferromix2-gui) still builds if you need it.
+- The old egui GUI (`mixer-gui`) has been removed — `mixer-gui-iced` is now
+  the only GUI and has full feature parity (rename, record-arm, log tab,
+  UI-scale, recordings-dir editing, add-strip).
 - DSP tests: cargo test -p mixer-pw --lib dsp
 
 ## v2.0.1 — routing bleed fix (critical)
@@ -104,3 +106,49 @@ The Iced GUI was missing the default-device buttons. Now:
   A) Set the app's OUTPUT to "FerroMix Input N" in the app/KDE audio settings, OR
   B) Click SET AS DEFAULT on the strip you want desktop audio on — then every
      default app lands there automatically.
+
+## v2.5.0 — persistence, mix-minus fix, live DSP, full visual overhaul
+- FIX: the Iced GUI never sent Command::Save — every fader/route/rename was
+  lost on daemon restart. Now autosaves ~1.5s after the last change, plus a
+  header SAVE button that shows dirty state.
+- FIX (mix-minus): `apply_bus_listeners` (the B-bus -> app-mic link) was only
+  called from a few command handlers, never from node-removal events — an
+  app's capture stream disappearing/reappearing (reconnect) could permanently
+  strand a bus's mix-minus feed. Folded into a `reconcile_all` that runs on
+  every convergence pass, matching the reconciler's own declarative design.
+  Also fixed `resolve_capture` to fall back to substring matching like
+  `resolve_source` already did. New `trace_mixminus.sh` diagnostic.
+- DSP is now LIVE: gate/compressor actually process audio, verified end-to-end
+  against a running daemon (`pw-dump`/`pw-link -l` confirm `ferromix.dsp.N.in`
+  sits between the source and the strip, and `.out` feeds the strip). Four
+  real bugs found by loading the module for real instead of trusting the
+  SPA-JSON generator's unit tests:
+  1. The gate's builtin label is `noisegate`, not `gate` (module refused to
+     load: "cannot create label gate").
+  2. Its threshold control keys are case-sensitive: `Open Threshold`/`Close
+     Threshold`, not `Open threshold`/`Close threshold`.
+  3. Those threshold ports are LINEAR AMPLITUDE (SPA range 0.0..1.0), not dB —
+     the original code passed raw dB values (e.g. -60.0), which silently
+     clamped to the port's minimum, so the gate loaded fine but every
+     threshold setting behaved identically. Now converted via `db_to_lin`.
+  4. PipeWire's builtin filter-graph has NO compressor at all, and the gate
+     turns out to be MONO while a proper compressor needs stereo — so the
+     graph is now two `noisegate` instances (`gate_l`/`gate_r`) feeding the
+     SC4 LADSPA compressor's Left/Right inputs (`ladspa-swh-plugins`, new
+     runtime dependency; exact port names confirmed with `analyseplugin
+     sc4_1882.so`), not a single mono gate->comp chain.
+  A knob change reloads the strip's filter-chain module (destroy + recreate
+  with the new values baked into fresh SPA-JSON) rather than pushing live
+  params into the running chain's internal nodes — simpler and safe, costs a
+  few ms of dropout on that strip only. Confirmed the reload path replaces
+  cleanly (new node ids each time, no leaked/duplicate `ferromix.dsp.*` nodes).
+- Full visual overhaul: bundled Inter font, an SVG icon set replacing the
+  Unicode glyphs, a design-token module (spacing/radius/type scale) instead
+  of scattered magic numbers, hand-drawn canvas faders (matching the DSP
+  knob's glow language) replacing the restyled built-in slider, a bloom
+  highlight on the VU meter's peak segment, and a resizable window with
+  strip/bus cards that shrink responsively instead of clipping.
+- New controls: click-to-rename strip/bus headers, REC arm buttons, an
+  ACTIVITY LOG tab (was tracked in state, never shown), a UI-scale stepper,
+  and an editable recordings-dir field — all previously-unwired `Command`s.
+- The old egui GUI (`mixer-gui`) is removed; `mixer-gui-iced` has full parity.

@@ -1,12 +1,12 @@
 # Maintainer: you <you@example.com>
-pkgname=ferromix-git
-pkgver=0.1.0
+pkgname=ferromix2-git
+pkgver=2.4.0
 pkgrel=1
 pkgdesc="Voicemeeter-style virtual audio mixer for PipeWire"
 arch=('x86_64')
 url="https://github.com/yourname/ferromix"
 license=('MIT')
-depends=('pipewire')
+depends=('pipewire' 'wireplumber' 'ladspa-swh-plugins')
 makedepends=('cargo' 'clang' 'pkgconf' 'git')
 source=("$pkgname::git+$url")
 sha256sums=('SKIP')
@@ -18,9 +18,10 @@ build() {
 
 package() {
   cd "$pkgname"
-  install -Dm755 target/release/ferromix-daemon "$pkgdir/usr/bin/ferromix-daemon"
-  install -Dm755 target/release/ferromix-gui "$pkgdir/usr/bin/ferromix-gui"
-  install -Dm644 packaging/ferromix.service "$pkgdir/usr/lib/systemd/user/ferromix.service"
-  install -Dm644 assets/ferromix.desktop "$pkgdir/usr/share/applications/ferromix.desktop"
+  install -Dm755 target/release/ferromix2-daemon "$pkgdir/usr/bin/ferromix2-daemon"
+  install -Dm755 target/release/ferromix2 "$pkgdir/usr/bin/ferromix2"
+  install -Dm644 packaging/ferromix2.service "$pkgdir/usr/lib/systemd/user/ferromix2.service"
+  install -Dm644 assets/ferromix2.desktop "$pkgdir/usr/share/applications/ferromix2.desktop"
+  install -Dm644 assets/ferromix2.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/ferromix2.svg"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

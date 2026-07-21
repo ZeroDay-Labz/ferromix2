@@ -9,7 +9,7 @@
 //! refused, so mix-minus can't arm an echo.
 
 use crate::registry::{self, Graph, NodeId, NodeKind};
-use crate::{links, recorder, tap, virtual_dev, PwCmd};
+use crate::{dsp, links, recorder, tap, virtual_dev, PwCmd};
 use mixer_core::backend::BackendEvent;
 use mixer_core::model::{self as m, BusKind, Device, LevelKey, RecTarget, SourceInfo, SourceKind};
 use pipewire as pw;
@@ -25,6 +25,22 @@ use std::sync::mpsc::Sender;
 /// meter work uniformly for every kind of input.
 fn strip_name(idx: usize) -> String {
     format!("ferromix.strip.{idx}")
+}
+
+/// If `name` is a DSP filter-chain node we created (`ferromix.dsp.{idx}.in` /
+/// `.out`), return which strip it belongs to and whether it's the in or out
+/// side. Used to keep these nodes out of the ordinary bus-adoption path (they
+/// aren't adapter nodes we create via a factory — the filter-chain module
+/// creates them itself once loaded) and to populate `dsp_nodes`.
+fn dsp_node_role(name: &str) -> Option<(usize, bool)> {
+    let rest = name.strip_prefix("ferromix.dsp.")?;
+    let (idx_str, suffix) = rest.split_once('.')?;
+    let idx: usize = idx_str.parse().ok()?;
+    match suffix {
+        "in" => Some((idx, true)),
+        "out" => Some((idx, false)),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -44,6 +60,11 @@ enum Slot {
     /// let it fall back to grabbing the raw default source. Drawing the link
     /// directly sidesteps WirePlumber entirely.
     BusListener(usize, NodeId),
+    /// source -> strip's DSP filter-chain input (used instead of `StripIn`
+    /// once a strip has a loaded gate/compressor module).
+    DspIn(usize),
+    /// strip's DSP filter-chain output -> strip device.
+    DspOut(usize),
 }
 
 #[derive(Default)]
@@ -99,6 +120,12 @@ struct WorkerState {
     last_capture_apps: Vec<SourceInfo>,
     last_sources: Vec<SourceInfo>,
     last_devices: Vec<Device>,
+    /// strip -> its loaded gate/compressor filter-chain module, if touched.
+    dsp_modules: HashMap<usize, dsp::DspModule>,
+    /// strip -> (dsp.in node, dsp.out node), filled in as each side's node
+    /// appears in the registry after its module loads. Both must be `Some`
+    /// before reconcile splices the DSP path in.
+    dsp_nodes: HashMap<usize, (Option<NodeId>, Option<NodeId>)>,
 }
 
 #[derive(Clone)]
@@ -106,6 +133,9 @@ struct Ctx {
     // 0.9's `*Rc` handles are themselves reference-counted, so we no longer
     // wrap them in std::rc::Rc.
     core: pw::core::CoreRc,
+    /// Needed only to load the per-strip DSP filter-chain module
+    /// (`pw_context_load_module` operates on the context, not the core).
+    context: pw::context::ContextRc,
     registry: pw::registry::RegistryRc,
     ev_tx: Sender<BackendEvent>,
     st: Rc<RefCell<WorkerState>>,
@@ -126,6 +156,7 @@ pub(crate) fn run(cmd_rx: pw::channel::Receiver<PwCmd>, ev_tx: Sender<BackendEve
 
     let ctx = Ctx {
         core,
+        context,
         registry: registry.clone(),
         ev_tx: ev_tx.clone(),
         st: Rc::new(RefCell::new(WorkerState { feedback_guard: true, ..Default::default() })),
@@ -192,11 +223,28 @@ fn on_global(ctx: &Ctx, g: &pw::registry::GlobalObject<&pw::spa::utils::dict::Di
             let Some(props) = g.props else { return };
             let Some(node) = registry::parse_node(g.id, props) else { return };
             let kind = node.kind();
+            let dsp_role = dsp_node_role(&node.name);
 
             let ours = node.name.starts_with("ferromix.")
                 && !node.name.contains(".tap.")
-                && !node.name.contains(".rec.");
-            if ours {
+                && !node.name.contains(".rec.")
+                && dsp_role.is_none();
+            if let Some((idx, is_in)) = dsp_role {
+                // Not an adapter node we created via a factory (the filter-chain
+                // module creates these itself once loaded) — don't route it
+                // through the bus-adoption path, just record which node id is
+                // which side so reconcile can splice it into the strip's path.
+                if let Ok(bound) = ctx.registry.bind::<pw::node::Node, _>(g) {
+                    let mut st = ctx.st.borrow_mut();
+                    st.bound.insert(node.id, bound);
+                    let entry = st.dsp_nodes.entry(idx).or_insert((None, None));
+                    if is_in {
+                        entry.0 = Some(node.id);
+                    } else {
+                        entry.1 = Some(node.id);
+                    }
+                }
+            } else if ours {
                 if let Ok(bound) = ctx.registry.bind::<pw::node::Node, _>(g) {
                     ctx.st.borrow_mut().bus_by_name.insert(node.name.clone(), (node.id, bound));
                 }
@@ -212,8 +260,7 @@ fn on_global(ctx: &Ctx, g: &pw::registry::GlobalObject<&pw::spa::utils::dict::Di
             apply_strip_controls(ctx);
             emit_inventory(ctx);
             emit_capture_apps(ctx);
-            apply_bus_listeners(ctx);
-            reconcile(ctx);
+            reconcile_all(ctx);
         }
         pw::types::ObjectType::Metadata => {
             let name = g.props.and_then(|p| p.get("metadata.name")).unwrap_or("");
@@ -231,14 +278,14 @@ fn on_global(ctx: &Ctx, g: &pw::registry::GlobalObject<&pw::spa::utils::dict::Di
             let Some(props) = g.props else { return };
             if let Some(port) = registry::parse_port(g.id, props) {
                 ctx.st.borrow_mut().graph.ports.insert(port.id, port);
-                reconcile(ctx);
+                reconcile_all(ctx);
             }
         }
         pw::types::ObjectType::Link => {
             let Some(props) = g.props else { return };
             if let Some(link) = registry::parse_link(g.id, props) {
                 ctx.st.borrow_mut().graph.links.insert(link.id, link);
-                reconcile(ctx);
+                reconcile_all(ctx);
                 emit_listeners(ctx);
             }
         }
@@ -254,6 +301,19 @@ fn on_global_remove(ctx: &Ctx, id: u32) {
             st.stream_targets.remove(&id);
             st.capture_targets.remove(&id);
             st.bus_by_name.remove(&node.name);
+            if let Some((idx, is_in)) = dsp_node_role(&node.name) {
+                // The module itself owns this node's lifetime; if it vanished
+                // out from under us (e.g. module crashed), forget the id so
+                // reconcile falls back to the direct source->strip path
+                // instead of trying to link into a dead node.
+                if let Some(entry) = st.dsp_nodes.get_mut(&idx) {
+                    if is_in {
+                        entry.0 = None;
+                    } else {
+                        entry.1 = None;
+                    }
+                }
+            }
             let gone: Vec<usize> = st.bus_nodes.iter().filter(|(_, (nid, _))| *nid == id).map(|(i, _)| *i).collect();
             for i in gone {
                 st.bus_nodes.remove(&i);
@@ -270,7 +330,7 @@ fn on_global_remove(ctx: &Ctx, id: u32) {
         st.graph.links.remove(&id);
     }
     emit_inventory(ctx);
-    reconcile(ctx);
+    reconcile_all(ctx);
 }
 
 /// Create/adopt bus null-sinks for every desired bus.
@@ -428,10 +488,11 @@ fn ensure_bus_device(ctx: &Ctx, idx: usize, label: &str, kind: BusKind) {
     }
 }
 
-/// Resolve a source key to the live node ids backing it.
-fn resolve_source(st: &WorkerState, key: &str) -> Vec<NodeId> {
+/// Resolve a source key to the live node ids backing it. Pure over `Graph` so
+/// it's unit-testable without a `WorkerState`/live PipeWire connection.
+fn resolve_source(graph: &Graph, key: &str) -> Vec<NodeId> {
     let key_l = key.to_lowercase();
-    st.graph
+    graph
         .nodes
         .values()
         .filter(|n| {
@@ -446,15 +507,78 @@ fn resolve_source(st: &WorkerState, key: &str) -> Vec<NodeId> {
 
 /// Faders and mutes act on the strip's own device node — never on the app or
 /// the mic, so they behave identically for every kind of input.
-/// Capture (microphone) stream nodes belonging to an app.
-fn resolve_capture(st: &WorkerState, key: &str) -> Vec<NodeId> {
+/// Capture (microphone) stream nodes belonging to an app. Pure over `Graph`,
+/// same reasoning as `resolve_source`.
+fn resolve_capture(graph: &Graph, key: &str) -> Vec<NodeId> {
     let key_l = key.to_lowercase();
-    st.graph
+    graph
         .nodes
         .values()
-        .filter(|n| n.kind() == NodeKind::AppCapture && n.source_key() == key_l)
+        .filter(|n| {
+            n.kind() == NodeKind::AppCapture && {
+                let k = n.source_key();
+                // Same substring fallback as resolve_source: a bus_listener key
+                // recorded before an app's exact stream name settles (or that
+                // drifts slightly across relaunches) would otherwise silently
+                // match nothing, leaving the B-bus listener link never drawn.
+                k == key_l || k.contains(&key_l)
+            }
+        })
         .map(|n| n.id)
         .collect()
+}
+
+/// Which nodes does `out_node`'s output currently reach besides anything in
+/// `keep`? Used to redirect an app fully onto its assigned strip(s) instead
+/// of also leaving it fanned out to wherever it was linked before (commonly a
+/// pipewire-pulse role loopback sink, e.g. `input.loopback.sink.role.
+/// multimedia` — confirmed live: Spotify was linked to BOTH its FerroMix
+/// strip and that loopback simultaneously, so the strip's fader/mute had no
+/// audible effect since Spotify kept playing through the untouched path).
+///
+/// `keep` is a slice, not a single node: an app CAN legitimately be assigned
+/// to more than one FerroMix strip/bus at once (both are "ours" and desired),
+/// and treating a second legitimate FerroMix destination as "stray" relative
+/// to the first would make our own two desired links fight each other every
+/// reconcile pass — confirmed live: with the same app assigned as both B1's
+/// and B2's listener, an earlier single-`keep` version of this cut Discord's
+/// B2 link "stray" while processing B1's, then cut B1's link "stray" while
+/// processing B2's, back and forth every pass.
+///
+/// Pure over `Graph`, deduplicated (a stereo app has two links — FL/FR — to
+/// the same stray destination, which should be one redirect, not two).
+fn stray_destinations(graph: &Graph, out_node: NodeId, keep: &[NodeId]) -> Vec<NodeId> {
+    let mut v: Vec<NodeId> = graph
+        .links
+        .values()
+        .filter(|l| l.out_node == out_node && !keep.contains(&l.in_node))
+        .map(|l| l.in_node)
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Which nodes currently feed INTO `in_node` besides anything in `keep`? The
+/// capture-side mirror of `stray_destinations` (see its doc for why `keep` is
+/// a slice, not a single node — an app can legitimately listen to more than
+/// one FerroMix bus at once). An app's microphone capture node commonly has
+/// its real default microphone auto-connected by WirePlumber the instant the
+/// node appears (`find-default-target.lua` runs synchronously, before our own
+/// B-bus link can land), so pointing it at a B-bus without cutting that stray
+/// source leaves the app hearing its real mic and the bus mixed together
+/// permanently — the same class of bug `stray_destinations` fixes for
+/// playback, just the opposite link direction.
+fn stray_sources(graph: &Graph, in_node: NodeId, keep: &[NodeId]) -> Vec<NodeId> {
+    let mut v: Vec<NodeId> = graph
+        .links
+        .values()
+        .filter(|l| l.in_node == in_node && !keep.contains(&l.out_node))
+        .map(|l| l.out_node)
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Point the assigned app's microphone at each B bus, using the same
@@ -475,7 +599,7 @@ fn apply_bus_listeners(ctx: &Ctx) {
                 continue;
             }
             let Some(&(bus_node, _)) = st.bus_nodes.get(bus) else { continue };
-            for cap in resolve_capture(&st, key) {
+            for cap in resolve_capture(&st.graph, key) {
                 v.push((*bus, bus_node, cap));
             }
         }
@@ -497,13 +621,38 @@ fn apply_bus_listeners(ctx: &Ctx) {
     }
 
     // Ensure the wanted links exist.
-    for (bus, bus_node, cap) in desired {
+    for &(bus, bus_node, cap) in &desired {
         let already = ctx.st.borrow().listener_links.contains_key(&(bus, cap));
         if !already {
             let mut st = ctx.st.borrow_mut();
             ensure_links(&ctx.core, &mut st, Slot::BusListener(bus, cap), bus_node, cap);
             st.listener_links.insert((bus, cap), ());
             log::info!("MIC LINK bus.{bus} -> {}", nname(&st, cap));
+        }
+    }
+
+    // Redirect: cut anything feeding an app's capture that ISN'T one of its
+    // legitimately-assigned FerroMix buses — typically the app's real default
+    // microphone, auto-connected by WirePlumber before we could react (see
+    // `stray_sources`'s doc). Grouped by capture node first, keeping EVERY
+    // bus assigned to it (an app can legitimately listen to more than one
+    // B-bus at once — see `stray_sources`'s doc for why a single-`keep`
+    // version of this fought itself). Runs every pass, not gated behind
+    // `already`, so a stray link that reappears later still gets caught —
+    // cheap no-op once the capture is already exclusive to FerroMix buses.
+    let mut legit_by_cap: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for &(_, bus_node, cap) in &desired {
+        legit_by_cap.entry(cap).or_default().push(bus_node);
+    }
+    for (cap, keep) in legit_by_cap {
+        let stray = {
+            let st = ctx.st.borrow();
+            stray_sources(&st.graph, cap, &keep)
+        };
+        for other in stray {
+            let mut st = ctx.st.borrow_mut();
+            log::info!("REDIRECT {} off {} (mic now exclusively FerroMix)", nname(&st, cap), nname(&st, other));
+            remove_links_between(ctx, &mut st, other, cap);
         }
     }
 }
@@ -719,19 +868,58 @@ fn listens(
         .any(|cap| graph.has_link(bus_node, cap.id))
 }
 
+/// Converge the graph AND the B-bus→app-mic listener links in one pass. Every
+/// call site that used to call `reconcile()` alone should call this instead —
+/// `apply_bus_listeners` is desired-state convergence exactly like the rest of
+/// `reconcile()`, just factored out because it needs its own borrow. Before
+/// this, a listener link that got torn down by node churn (e.g. an app's
+/// capture stream briefly disappearing on reconnect) only got redrawn if a
+/// command handler happened to call `apply_bus_listeners` explicitly —
+/// `on_global_remove` never did, so a dropped-and-recreated capture node could
+/// permanently strand a bus's mix-minus feed until the user re-picked the app
+/// in SEND TO APP. Folding it in here means every registry event and every
+/// command reconverges listener links too, matching the "declarative
+/// reconciler" architecture (see docs/ARCHITECTURE.md).
+fn reconcile_all(ctx: &Ctx) {
+    apply_bus_listeners(ctx);
+    reconcile(ctx);
+}
+
 fn reconcile(ctx: &Ctx) {
     let mut feedback: Vec<(usize, usize)> = Vec::new();
     {
         let mut st = ctx.st.borrow_mut();
         let st = &mut *st;
 
-        // 1. source -> strip device
+        // 1. source -> strip device. If the strip has a loaded gate/compressor
+        //    (both its dsp.in and dsp.out nodes have shown up in the registry),
+        //    route source -> dsp.in and dsp.out -> strip device instead of a
+        //    direct link, so the chain sits between the source and everything
+        //    the fader/mute/meter/sends act on. Strips that have never touched
+        //    DSP take the direct path exactly as before — zero overhead.
         let inputs: Vec<(usize, String)> =
             st.desired.strip_input.iter().map(|(i, k)| (*i, k.clone())).collect();
         for (idx, key) in inputs {
             let Some(&(strip_node, _)) = st.strip_nodes.get(&idx) else { continue };
-            for src in resolve_source(st, &key) {
-                ensure_links(&ctx.core, st, Slot::StripIn(idx), src, strip_node);
+            let dsp_target = st.dsp_nodes.get(&idx).and_then(|(i, o)| i.zip(*o));
+            match dsp_target {
+                Some((dsp_in, dsp_out)) => {
+                    // Tear down any direct source->strip link left over from
+                    // before this strip's DSP module finished coming up.
+                    for src in resolve_source(&st.graph, &key) {
+                        remove_links_between(ctx, st, src, strip_node);
+                    }
+                    st.link_proxies.remove(&Slot::StripIn(idx));
+                    for src in resolve_source(&st.graph, &key) {
+                        ensure_links(&ctx.core, st, Slot::DspIn(idx), src, dsp_in);
+                    }
+                    ensure_links(&ctx.core, st, Slot::DspOut(idx), dsp_out, strip_node);
+                }
+                None => {
+                    for src in resolve_source(&st.graph, &key) {
+                        ensure_links(&ctx.core, st, Slot::StripIn(idx), src, strip_node);
+                    }
+                }
             }
         }
 
@@ -739,35 +927,74 @@ fn reconcile(ctx: &Ctx) {
         //    using PipeWire metadata (`target.object`) — the same mechanism
         //    `pw-metadata <id> target.object <name>` uses.
         //
-        //    We must NOT destroy the app's existing links: WirePlumber owns
-        //    stream placement and instantly recreates them, which turns into an
-        //    endless destroy/recreate war (it did — hundreds of times a second).
-        //    Setting the target tells the session manager where the stream
-        //    belongs, and it moves it and keeps it there.
-        let targets: Vec<(NodeId, String)> = {
+        //    We must NOT repeatedly destroy the app's links every reconcile
+        //    pass: WirePlumber owns stream placement and would instantly
+        //    recreate them, turning into an endless destroy/recreate war (it
+        //    did — hundreds of times a second). Setting the target tells the
+        //    session manager where the stream belongs, and it moves it and
+        //    keeps it there for links it creates AFTER this point.
+        //
+        //    But metadata alone isn't enough for pipewire-pulse clients
+        //    (Spotify, Firefox, anything going through the PulseAudio
+        //    compat layer): confirmed live that Spotify's stream was fanned
+        //    out to BOTH its FerroMix strip AND
+        //    input.loopback.sink.role.multimedia (a pipewire-pulse role-based
+        //    loopback sink) simultaneously — the role loopback link is
+        //    created by pipewire-pulse's own routing, independent of (and not
+        //    reverted by) target.object. That left the strip's fader/mute
+        //    with no audible effect, since the app kept playing through the
+        //    untouched loopback path. Confirmed empirically that cutting that
+        //    stray link is a ONE-TIME fix, not a fight: it does not get
+        //    recreated afterward, so we do it exactly once per (app, strip)
+        //    assignment — the same instant we set the metadata — never on
+        //    every pass, which is what avoids re-triggering the documented war.
+        let targets: Vec<(NodeId, NodeId, String)> = {
             let mut v = Vec::new();
             for (idx, key) in st.desired.strip_input.iter() {
-                let Some(&(_, _)) = st.strip_nodes.get(idx) else { continue };
+                let Some(&(strip_node, _)) = st.strip_nodes.get(idx) else { continue };
                 let name = strip_name(*idx);
-                for src in resolve_source(st, key) {
+                for src in resolve_source(&st.graph, key) {
                     if st.graph.nodes.get(&src).map(|n| n.kind()) == Some(NodeKind::AppPlayback) {
-                        v.push((src, name.clone()));
+                        v.push((src, strip_node, name.clone()));
                     }
                 }
             }
             v
         };
-        for (node, target) in targets {
-            if st.stream_targets.get(&node) == Some(&target) {
-                continue; // already pointed there
+        for (node, _strip_node, target) in &targets {
+            // Metadata write is still latched to once-per-(node,target): this
+            // is the part that risked the destroy/recreate war if repeated.
+            if st.stream_targets.get(node) != Some(target) {
+                st.stream_targets.insert(*node, target.clone());
+                if let Some(md) = st.metadata.as_ref() {
+                    let json = format!("\"{target}\"");
+                    md.set_property(*node, "target.object", Some("Spa:String:JSON"), Some(&json));
+                    log::info!("TARGET {} -> {}", nname(st, *node), target);
+                } else {
+                    log::warn!("cannot retarget {}: no metadata object", nname(st, *node));
+                }
             }
-            st.stream_targets.insert(node, target.clone());
-            if let Some(md) = st.metadata.as_ref() {
-                let json = format!("\"{target}\"");
-                md.set_property(node, "target.object", Some("Spa:String:JSON"), Some(&json));
-                log::info!("TARGET {} -> {}", nname(st, node), target);
-            } else {
-                log::warn!("cannot retarget {}: no metadata object", nname(st, node));
+        }
+        // Redirect: cut anything else this app's output reaches besides its
+        // legitimately-assigned strip(s). Grouped by source node, keeping
+        // EVERY strip it's assigned to — an app can legitimately be assigned
+        // as the input for more than one strip, and treating a second
+        // legitimate strip as "stray" relative to the first would make our
+        // own two desired links fight each other every pass (confirmed live
+        // for the capture-side equivalent of this, see `stray_sources`'s
+        // doc — same fix applied here for consistency). Deliberately NOT
+        // gated behind the metadata latch above — cheap no-op once already
+        // exclusive, but catches a stray link that reappears later without
+        // the node itself disappearing, which the old one-shot-only version
+        // could never see again once `stream_targets` already matched.
+        let mut legit_by_src: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        for &(node, strip_node, _) in &targets {
+            legit_by_src.entry(node).or_default().push(strip_node);
+        }
+        for (node, keep) in legit_by_src {
+            for other in stray_destinations(&st.graph, node, &keep) {
+                log::info!("REDIRECT {} off {} (now exclusively on FerroMix)", nname(st, node), nname(st, other));
+                remove_links_between(ctx, st, node, other);
             }
         }
 
@@ -820,6 +1047,25 @@ fn reconcile(ctx: &Ctx) {
             .collect();
         for b in hw_buses {
             let Some(&(bus_node, _)) = st.bus_nodes.get(&b) else { continue };
+            // MUTE means the bus sends nowhere. Same reasoning as strip mute
+            // (step 3): a null-sink's mute flag alone doesn't stop its
+            // monitor from emitting, so cut the actual link rather than
+            // relying on `set_node_mute`. This guard was missing entirely
+            // before — muting an A-bus never actually silenced it, the
+            // hardware-output link stayed up regardless of mute state.
+            // Sweep ALL of bus_node's current links rather than only the
+            // configured target, so a stale link to a since-changed device
+            // still gets cut.
+            if st.desired.bus_mute.get(&b).copied().unwrap_or(false) {
+                let mut dests: Vec<NodeId> =
+                    st.graph.links.values().filter(|l| l.out_node == bus_node).map(|l| l.in_node).collect();
+                dests.sort();
+                dests.dedup();
+                for hw in dests {
+                    remove_links_between(ctx, st, bus_node, hw);
+                }
+                continue;
+            }
             let target = st.desired.bus_dev.get(&b).cloned().flatten();
             if let Some(hw) = find_hw_sink(st, target.as_deref()) {
                 ensure_links(&ctx.core, st, Slot::BusDev(b), bus_node, hw);
@@ -948,7 +1194,7 @@ fn remove_slot_links(ctx: &Ctx, slot: &Slot) {
         Slot::StripIn(idx) => {
             let key = st.desired.strip_input.get(idx).cloned();
             match (key, st.strip_nodes.get(idx).map(|(id, _)| *id)) {
-                (Some(k), Some(n)) => Some((resolve_source(&st, &k), n)),
+                (Some(k), Some(n)) => Some((resolve_source(&st.graph, &k), n)),
                 (None, Some(n)) => {
                     // Input cleared: drop everything feeding the strip that
                     // isn't an app which pointed itself here.
@@ -983,6 +1229,22 @@ fn remove_slot_links(ctx: &Ctx, slot: &Slot) {
             st.bus_nodes.get(bus).map(|(id, _)| *id).map(|bus_node| (vec![bus_node], *cap))
         }
         Slot::BusDev(_) => None,
+        Slot::DspIn(idx) => {
+            let key = st.desired.strip_input.get(idx).cloned();
+            let dsp_in = st.dsp_nodes.get(idx).and_then(|(i, _)| *i);
+            match (key, dsp_in) {
+                (Some(k), Some(dsp_in)) => Some((resolve_source(&st.graph, &k), dsp_in)),
+                _ => None,
+            }
+        }
+        Slot::DspOut(idx) => {
+            let dsp_out = st.dsp_nodes.get(idx).and_then(|(_, o)| *o);
+            let strip_node = st.strip_nodes.get(idx).map(|(id, _)| *id);
+            match (dsp_out, strip_node) {
+                (Some(dsp_out), Some(strip_node)) => Some((vec![dsp_out], strip_node)),
+                _ => None,
+            }
+        }
     };
     if let Some((outs, in_node)) = endpoints {
         for o in outs {
@@ -997,14 +1259,14 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
         PwCmd::EnsureStrip { idx, label } => {
             ctx.st.borrow_mut().desired.strips.insert(idx, label);
             ensure_strip_device(ctx, idx);
-            reconcile(ctx);
+            reconcile_all(ctx);
         }
         PwCmd::SetStripInput { idx, source_key } => {
             // No-op if nothing actually changed. The engine re-pushes strip
             // inputs whenever the app list moves, and blindly relinking caused
             // a needless UNLINK/LINK glitch on every app appearing.
             if ctx.st.borrow().desired.strip_input.get(&idx) == source_key.as_ref() {
-                reconcile(ctx);
+                reconcile_all(ctx);
                 return;
             }
             // Release any app we had pointed at this strip, so WirePlumber is
@@ -1012,7 +1274,7 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             {
                 let mut st = ctx.st.borrow_mut();
                 if let Some(old) = st.desired.strip_input.get(&idx).cloned() {
-                    let nodes = resolve_source(&st, &old);
+                    let nodes = resolve_source(&st.graph, &old);
                     for n in nodes {
                         if st.stream_targets.remove(&n).is_some() {
                             if let Some(md) = st.metadata.as_ref() {
@@ -1034,7 +1296,7 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                     }
                 }
             }
-            reconcile(ctx);
+            reconcile_all(ctx);
         }
         PwCmd::SetStripVolume { idx, volume } => {
             ctx.st.borrow_mut().desired.strip_vol.insert(idx, volume);
@@ -1045,21 +1307,48 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             // Mute also cuts/restores the strip's sends, so reconcile the graph
             // rather than only toggling the node flag.
             apply_strip_controls(ctx);
-            reconcile(ctx);
+            reconcile_all(ctx);
         }
         PwCmd::SetStripAssign { idx, bus, on } => {
             if on {
                 ctx.st.borrow_mut().desired.assigns.insert((idx, bus));
-                reconcile(ctx);
+                reconcile_all(ctx);
             } else {
                 ctx.st.borrow_mut().desired.assigns.remove(&(idx, bus));
                 remove_slot_links(ctx, &Slot::Send(idx, bus));
-                reconcile(ctx);
+                reconcile_all(ctx);
+            }
+        }
+        PwCmd::SetStripDsp { idx, dsp } => {
+            // Always (re)load: a fresh module with the new control values
+            // baked into its SPA-JSON args. Replacing the HashMap entry drops
+            // (and so destroys, via DspModule's Drop) whatever module was
+            // there before — see dsp.rs's docstring for why this reloads
+            // instead of pushing live param updates into the running chain.
+            match dsp::load_filter_chain(&ctx.context, idx, &dsp) {
+                Ok(module) => {
+                    let mut st = ctx.st.borrow_mut();
+                    st.dsp_modules.insert(idx, module);
+                    // The old dsp.in/out node ids (if any) just got destroyed
+                    // along with the old module — forget them so reconcile
+                    // falls back to the direct source->strip path until the
+                    // new module's nodes show up in the registry.
+                    st.dsp_nodes.remove(&idx);
+                    drop(st);
+                    ctx.log(format!(
+                        "DSP strip {} — gate {} / comp {}",
+                        idx + 1,
+                        if dsp.gate_on { "on" } else { "off" },
+                        if dsp.comp_on { "on" } else { "off" }
+                    ));
+                    reconcile_all(ctx);
+                }
+                Err(e) => ctx.log(format!("DSP load FAILED for strip {}: {e}", idx + 1)),
             }
         }
         PwCmd::SetFeedbackGuard { on } => {
             ctx.st.borrow_mut().feedback_guard = on;
-            reconcile(ctx);
+            reconcile_all(ctx);
         }
         PwCmd::SetDefaultOutput { idx } => {
             let name = strip_name(idx);
@@ -1083,7 +1372,7 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
         PwCmd::EnsureBus { idx, label, kind } => {
             ctx.st.borrow_mut().desired.buses.insert(idx, (label.clone(), kind));
             ensure_bus_device(ctx, idx, &label, kind);
-            reconcile(ctx);
+            reconcile_all(ctx);
         }
         PwCmd::SetBusDevice { idx, device } => {
             ctx.st.borrow_mut().desired.bus_dev.insert(idx, device);
@@ -1104,7 +1393,7 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                     }
                 }
             }
-            reconcile(ctx);
+            reconcile_all(ctx);
         }
         PwCmd::SetBusVolume { idx, volume } => {
             let mut st = ctx.st.borrow_mut();
@@ -1149,20 +1438,42 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                 for a in mons {
                     remove_slot_links(ctx, &Slot::Monitor(idx, a));
                 }
+                // A-bus (hardware output): drop its hardware-sink link too.
+                // This was missing entirely before — muting an A-bus never
+                // actually silenced it, since only listener/monitor links
+                // were cut here and reconcile()'s step 4 never checked mute
+                // at all (now fixed there too, but that only takes effect on
+                // the next reconcile pass — cutting it here makes MUTE take
+                // effect immediately, same as the listener/monitor cuts above).
+                let bus_node = ctx.st.borrow().bus_nodes.get(&idx).map(|(id, _)| *id);
+                if let Some(bus_node) = bus_node {
+                    let dests: Vec<NodeId> = {
+                        let st = ctx.st.borrow();
+                        let mut d: Vec<NodeId> =
+                            st.graph.links.values().filter(|l| l.out_node == bus_node).map(|l| l.in_node).collect();
+                        d.sort();
+                        d.dedup();
+                        d
+                    };
+                    let mut st = ctx.st.borrow_mut();
+                    for hw in dests {
+                        remove_links_between(ctx, &mut st, bus_node, hw);
+                    }
+                }
             } else {
-                // Un-mute: reconcile rebuilds the wanted links.
-                apply_bus_listeners(ctx);
-                reconcile(ctx);
+                // Un-mute: reconcile_all rebuilds the wanted links (including
+                // the listener link and, now, the hardware-device link).
+                reconcile_all(ctx);
             }
         }
         PwCmd::SetBusMonitor { bus, a_bus, on } => {
             if on {
                 ctx.st.borrow_mut().monitors.insert((bus, a_bus));
-                reconcile(ctx);
+                reconcile_all(ctx);
             } else {
                 ctx.st.borrow_mut().monitors.remove(&(bus, a_bus));
                 remove_slot_links(ctx, &Slot::Monitor(bus, a_bus));
-                reconcile(ctx);
+                reconcile_all(ctx);
             }
         }
         PwCmd::SetBusListener { bus, app_key } => {
@@ -1170,7 +1481,7 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                 let mut st = ctx.st.borrow_mut();
                 // Release the previous app so WirePlumber can place it normally.
                 if let Some(old) = st.bus_listener.remove(&bus) {
-                    let nodes = resolve_capture(&st, &old);
+                    let nodes = resolve_capture(&st.graph, &old);
                     for n in nodes {
                         if st.capture_targets.remove(&n).is_some() {
                             if let Some(md) = st.metadata.as_ref() {
@@ -1346,5 +1657,139 @@ mod feedback_tests {
         let owners = owner_keys_of(&g, &strip_input, 0);
         assert_eq!(owners, vec!["corsair".to_string()], "mic strip owner must be only the mic");
         assert!(!listens(&g, &strip_input, 0, 500));
+    }
+
+    /// Regression for the "no mix-minus" bug: a capture stream whose binary
+    /// has drifted slightly from the key stored in `bus_listener` (e.g.
+    /// "discord-canary" vs the assigned "discord") must still resolve, the
+    /// same substring fallback `resolve_source` already had.
+    #[test]
+    fn resolve_capture_falls_back_to_substring_match() {
+        let mut g = Graph::default();
+        g.nodes.insert(10, app(10, "discord-canary", "Stream/Input/Audio"));
+        let found = resolve_capture(&g, "discord");
+        assert_eq!(found, vec![10], "substring match on capture key must still resolve the node");
+    }
+
+    #[test]
+    fn resolve_capture_exact_match_still_works() {
+        let mut g = Graph::default();
+        g.nodes.insert(10, app(10, "discord", "Stream/Input/Audio"));
+        assert_eq!(resolve_capture(&g, "discord"), vec![10]);
+    }
+
+    #[test]
+    fn resolve_capture_no_match_returns_empty() {
+        let mut g = Graph::default();
+        g.nodes.insert(10, app(10, "discord", "Stream/Input/Audio"));
+        assert!(resolve_capture(&g, "spotify").is_empty());
+    }
+
+    /// A playback (not capture) node with a matching key must never be
+    /// returned by resolve_capture — capture and playback are disjoint sets.
+    #[test]
+    fn resolve_capture_ignores_playback_nodes() {
+        let mut g = Graph::default();
+        g.nodes.insert(20, app(20, "discord", "Stream/Output/Audio"));
+        assert!(resolve_capture(&g, "discord").is_empty());
+    }
+
+    /// Regression for the "Spotify plays but the strip's fader does nothing"
+    /// bug: an app fanned out to both its FerroMix strip and a stray
+    /// destination (e.g. a pipewire-pulse role loopback) must report the
+    /// stray one so it can be cut.
+    #[test]
+    fn stray_destinations_finds_non_strip_link() {
+        let mut g = Graph::default();
+        g.links.insert(1, link(1, 100, 200)); // app(100) -> strip(200), keep
+        g.links.insert(2, link(2, 100, 900)); // app(100) -> loopback(900), stray
+        assert_eq!(stray_destinations(&g, 100, &[200]), vec![900]);
+    }
+
+    #[test]
+    fn stray_destinations_dedupes_stereo_links() {
+        let mut g = Graph::default();
+        g.links.insert(1, link(1, 100, 900)); // FL -> loopback
+        g.links.insert(2, link(2, 100, 900)); // FR -> loopback (same dest)
+        assert_eq!(stray_destinations(&g, 100, &[200]), vec![900]);
+    }
+
+    #[test]
+    fn stray_destinations_empty_when_exclusively_on_strip() {
+        let mut g = Graph::default();
+        g.links.insert(1, link(1, 100, 200));
+        g.links.insert(2, link(2, 100, 200));
+        assert!(stray_destinations(&g, 100, &[200]).is_empty());
+    }
+
+    #[test]
+    fn stray_destinations_ignores_unrelated_nodes_links() {
+        let mut g = Graph::default();
+        g.links.insert(1, link(1, 100, 200)); // our app -> our strip
+        g.links.insert(2, link(2, 300, 400)); // unrelated app -> unrelated node
+        assert!(stray_destinations(&g, 100, &[200]).is_empty());
+    }
+
+    /// Regression for a self-inflicted fight found live: with an app
+    /// legitimately assigned to TWO strips at once, a single-`keep` version
+    /// of this treated the second strip as "stray" relative to the first —
+    /// every destination in `keep` must be preserved, not just one.
+    #[test]
+    fn stray_destinations_keeps_multiple_legitimate_targets() {
+        let mut g = Graph::default();
+        g.links.insert(1, link(1, 100, 200)); // app -> strip A, both legit
+        g.links.insert(2, link(2, 100, 250)); // app -> strip B, both legit
+        g.links.insert(3, link(3, 100, 900)); // app -> loopback, stray
+        assert_eq!(stray_destinations(&g, 100, &[200, 250]), vec![900]);
+    }
+
+    /// Regression for the "B-bus routing doesn't work" bug: an app's mic
+    /// capture node fed by both the real default microphone AND our B-bus
+    /// must report the real mic as stray so it can be cut — otherwise the
+    /// receiving app hears both mixed together forever.
+    #[test]
+    fn stray_sources_finds_real_mic_alongside_bus() {
+        let mut g = Graph::default();
+        g.links.insert(1, link(1, 500, 999)); // bus(500) -> app capture(999), keep
+        g.links.insert(2, link(2, 600, 999)); // real mic(600) -> app capture(999), stray
+        assert_eq!(stray_sources(&g, 999, &[500]), vec![600]);
+    }
+
+    #[test]
+    fn stray_sources_dedupes_stereo_links() {
+        let mut g = Graph::default();
+        g.links.insert(1, link(1, 600, 999)); // FL
+        g.links.insert(2, link(2, 600, 999)); // FR, same stray source
+        assert_eq!(stray_sources(&g, 999, &[500]), vec![600]);
+    }
+
+    #[test]
+    fn stray_sources_empty_when_exclusively_from_bus() {
+        let mut g = Graph::default();
+        g.links.insert(1, link(1, 500, 999));
+        g.links.insert(2, link(2, 500, 999));
+        assert!(stray_sources(&g, 999, &[500]).is_empty());
+    }
+
+    #[test]
+    fn stray_sources_ignores_unrelated_nodes_links() {
+        let mut g = Graph::default();
+        g.links.insert(1, link(1, 500, 999)); // our bus -> our app capture
+        g.links.insert(2, link(2, 300, 400)); // unrelated
+        assert!(stray_sources(&g, 999, &[500]).is_empty());
+    }
+
+    /// Regression for the exact live bug found: Discord's mic was assigned as
+    /// listener to BOTH B1(500) and B2(700) simultaneously. A single-`keep`
+    /// version processed B1 first (cutting B2's link as "stray"), then
+    /// processed B2 (cutting B1's link as "stray" since it was just removed
+    /// and re-added), oscillating every reconcile pass. Both must be kept.
+    #[test]
+    fn stray_sources_keeps_multiple_legitimate_buses() {
+        let mut g = Graph::default();
+        g.links.insert(1, link(1, 500, 999)); // B1 -> Discord mic, legit
+        g.links.insert(2, link(2, 700, 999)); // B2 -> Discord mic, legit
+        g.links.insert(3, link(3, 600, 999)); // real mic -> Discord mic, stray
+        assert_eq!(stray_sources(&g, 999, &[500, 700]), vec![600]);
     }
 }

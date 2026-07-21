@@ -246,6 +246,9 @@ pub struct MixerState {
     pub default_output: Option<usize>,
     /// Bus index that is currently the system default input (if any).
     pub default_input: Option<usize>,
+    /// UI scale factor. 0.0 = auto (follow the monitor's DPI), else applied
+    /// directly as the window's scale factor.
+    pub ui_scale: f32,
     pub log: Vec<String>,
 }
 

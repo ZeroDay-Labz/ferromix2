@@ -2,6 +2,7 @@
 Type=Application
 Name=FerroMix
 Comment=Virtual audio mixer for PipeWire
-Exec=ferromix-gui
+Exec=ferromix2
+Icon=ferromix2
 Terminal=false
 Categories=AudioVideo;Audio;Mixer;

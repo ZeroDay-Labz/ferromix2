@@ -3,10 +3,14 @@
 ## Why a daemon/GUI split
 
 Voicemeeter dies when you close its window. FerroMix routing must not. The
-daemon (`ferromix-daemon`) owns everything PipeWire; the GUI is a disposable
-viewer/remote. Close it, reopen it, run two of them — audio never blinks.
-On Windows (or `--mock`), the GUI instead hosts the engine in-process against
-`MockBackend`, which is how the UI gets developed without a Linux box.
+daemon (`ferromix2-daemon`) owns everything PipeWire; the GUI
+(`mixer-gui-iced`, binary `ferromix2`) is a disposable IPC client — it only
+sends `Command`s and polls `MixerState` over the Unix socket, never touches
+PipeWire directly. Close it, reopen it, run two of them — audio never blinks.
+`mixer_core::mock::MockBackend` exists for backend-agnostic testing (see
+`mixer-core/src/mock.rs`), but the current GUI has no in-process/`--mock` mode
+of its own — that was an egui-GUI-era capability that didn't carry over when
+`mixer-gui` was retired in favor of the pure-IPC-client Iced GUI.
 
 ## The one abstraction: `AudioBackend`
 
@@ -64,8 +68,40 @@ app stream ──link──▶ strip (null sink, monitor.channel-volumes=true)
 - IPC: one thread per GUI client; 30 Hz `GetState` polling with
   length-prefixed bincode frames. Boring on purpose.
 
+## Per-strip DSP
+
+Each strip can own a `libpipewire-module-filter-chain` instance (loaded via a
+small unsafe FFI shim in `mixer-pw/src/dsp.rs` — the `pipewire` crate has no
+safe binding for `pw_context_load_module`), spliced in as
+`source → dsp.in → [gate_l/gate_r → sc4 compressor] → dsp.out → strip device`
+instead of the direct `source → strip device` link, via two extra `Slot`
+variants in the reconciler (`DspIn`/`DspOut`). Verified end-to-end against a
+live daemon (`pw-dump`/`pw-link -l`), which caught four real bugs the SPA-JSON
+generator's unit tests didn't (they only checked string formatting, not that
+the plugin/labels/ports/units were real):
+
+- The gate is a PipeWire builtin, `type = builtin`, `label = noisegate` — NOT
+  `label = gate`, which doesn't exist and fails to load.
+- The gate is MONO (one "In"/"Out" pair), so a stereo strip needs two
+  instances (`gate_l`, `gate_r`), not one.
+- The gate's `Open Threshold`/`Close Threshold` ports are LINEAR AMPLITUDE
+  (SPA range 0.0..1.0), not dB — passing a raw dB value silently clamps to
+  the port's minimum. Converted via `db_to_lin` (`10^(db/20)`).
+- PipeWire's builtin filter-graph has no compressor at all, so that stage
+  uses the SC4 LADSPA plugin (`plugin = sc4_1882`, `label = sc4`) from
+  `ladspa-swh-plugins` (a runtime dependency) — genuinely stereo
+  (`Left/Right input`/`Left/Right output`), confirmed via `analyseplugin
+  sc4_1882.so`.
+
+A knob change reloads the module (destroy + recreate with new args baked into
+the SPA-JSON) rather than pushing live params into the running chain's
+internal nodes — simpler, and the cost is a few ms of dropout on that one
+strip. Confirmed the reload path destroys the old module cleanly (fresh node
+ids, no leaked/duplicate `ferromix.dsp.*` nodes).
+
 ## Config → live state
 
-`config.toml` is the source of truth at startup; the GUI's `SAVE` folds live
-fader/mute/assign state back into it. Rules are edited in the file (v0.1) and
-take effect on the next engine start or app appearance.
+`config.toml` is the source of truth at startup; the Iced GUI autosaves
+(`Command::Save`) ~1.5s after the last change, and folds live
+fader/mute/assign/name/dsp state back into it. Rules are edited in the file
+and take effect on the next engine start or app appearance.

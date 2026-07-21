@@ -1,6 +1,6 @@
 //! The `AudioBackend` trait — the seam between the engine and audio.
 
-use crate::model::{BusKind, Device, Level, LevelKey, RecTarget, SourceInfo};
+use crate::model::{BusKind, Device, Level, LevelKey, RecTarget, SourceInfo, StripDsp};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -41,6 +41,11 @@ pub trait AudioBackend: Send {
     fn set_strip_mute(&mut self, idx: usize, mute: bool) -> BackendResult;
     /// Does strip `idx` feed bus `bus_idx`?
     fn set_strip_assign(&mut self, idx: usize, bus_idx: usize, on: bool) -> BackendResult;
+
+    /// Apply gate/compressor settings to strip `idx`'s live audio path. Loads
+    /// the strip's filter-chain module on first touch; later calls reload it
+    /// with the new values.
+    fn set_strip_dsp(&mut self, idx: usize, dsp: StripDsp) -> BackendResult;
 
     fn ensure_bus(&mut self, idx: usize, label: &str, kind: BusKind) -> BackendResult;
     fn set_bus_device(&mut self, idx: usize, device: Option<String>) -> BackendResult;

@@ -2,16 +2,29 @@
 //! the mixer state it polls over the Unix socket and sends `Command`s back. No
 //! PipeWire here, so the audio engine is never at risk while the UI evolves.
 
+mod icons;
 mod link;
 mod theme;
+mod tokens;
 mod widgets;
 
-use iced::widget::{column, container, row, scrollable, text, Space};
+use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Element, Length, Subscription, Task};
 use mixer_core::engine::Command;
 use mixer_core::model::{BusKind, MixerState};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// How long to wait after the last change before autosaving.
+const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(1500);
+
+/// Default window size — comfortable for the fixed-ish strip-card layout at
+/// startup. The window is resizable and has a real `min_size`; below the
+/// comfortable width, cards shrink (see `App::strip_card_width`) and the
+/// console row scrolls horizontally rather than clipping.
+const DEFAULT_WINDOW: (f32, f32) = (1620.0, 780.0);
+const MIN_WINDOW: (f32, f32) = (960.0, 600.0);
 
 fn main() -> iced::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -19,7 +32,23 @@ fn main() -> iced::Result {
     iced::application("FerroMix2", App::update, App::view)
         .subscription(App::subscription)
         .theme(|_| theme::base())
-        .window_size((1620.0, 780.0))
+        .scale_factor(|app: &App| {
+            app.state
+                .as_ref()
+                .map(|s| s.ui_scale as f64)
+                .filter(|s| *s > 0.0)
+                .unwrap_or(1.0)
+        })
+        .font(include_bytes!("../../../assets/fonts/Inter-Regular.ttf").as_slice())
+        .font(include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf").as_slice())
+        .font(include_bytes!("../../../assets/fonts/Inter-Bold.ttf").as_slice())
+        .default_font(theme::FONT_UI)
+        .window(iced::window::Settings {
+            size: DEFAULT_WINDOW.into(),
+            min_size: Some(MIN_WINDOW.into()),
+            resizable: true,
+            ..Default::default()
+        })
         .run_with(App::new)
 }
 
@@ -33,6 +62,17 @@ enum Tab {
     Console,
     Matrix,
     Settings,
+    Log,
+}
+
+/// What's currently being renamed via the click-to-edit header field on a
+/// strip/bus card. Only one at a time — starting a new rename discards any
+/// uncommitted draft for the previous target (same as clicking away in most
+/// apps' inline-rename UIs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameTarget {
+    Strip(usize),
+    Bus(usize),
 }
 
 struct App {
@@ -40,6 +80,16 @@ struct App {
     connected: bool,
     status: String,
     tab: Tab,
+    /// True when a command has been sent since the last successful save.
+    dirty: bool,
+    last_change: Option<Instant>,
+    /// Current window width, used to shrink strip/bus cards responsively
+    /// instead of clipping them when the window is resized down.
+    window_width: f32,
+    renaming: Option<(RenameTarget, String)>,
+    /// Recordings-dir edit-in-progress text, if the user has started typing
+    /// in the Settings field. `None` means "show `state.recordings_dir`".
+    recdir_draft: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +97,13 @@ enum Message {
     Link(link::FromLink),
     Tab(Tab),
     Send(Command),
+    WindowResized(f32),
+    RenameStart(RenameTarget, String),
+    RenameChanged(String),
+    RenameSubmit,
+    RenameCancel,
+    RecDirChanged(String),
+    RecDirApply,
     Tick,
 }
 
@@ -61,6 +118,11 @@ impl App {
                 connected: false,
                 status: "connecting to daemon…".into(),
                 tab: Tab::Console,
+                dirty: false,
+                last_change: None,
+                window_width: DEFAULT_WINDOW.0,
+                renaming: None,
+                recdir_draft: None,
             },
             Task::none(),
         )
@@ -89,15 +151,65 @@ impl App {
                 }
             },
             Message::Tab(t) => self.tab = t,
-            Message::Send(c) => self.send(c),
-            Message::Tick => {}
+            Message::WindowResized(w) => self.window_width = w,
+            Message::RenameStart(target, current) => self.renaming = Some((target, current)),
+            Message::RenameChanged(s) => {
+                if let Some((_, draft)) = &mut self.renaming {
+                    *draft = s;
+                }
+            }
+            Message::RenameSubmit => {
+                if let Some((target, draft)) = self.renaming.take() {
+                    let name = draft.trim().to_string();
+                    if !name.is_empty() {
+                        let cmd = match target {
+                            RenameTarget::Strip(strip) => Command::SetStripName { strip, name },
+                            RenameTarget::Bus(bus) => Command::SetBusName { bus, name },
+                        };
+                        self.dirty = true;
+                        self.last_change = Some(Instant::now());
+                        self.send(cmd);
+                    }
+                }
+            }
+            Message::RenameCancel => self.renaming = None,
+            Message::RecDirChanged(s) => self.recdir_draft = Some(s),
+            Message::RecDirApply => {
+                if let Some(path) = self.recdir_draft.take() {
+                    if !path.trim().is_empty() {
+                        self.dirty = true;
+                        self.last_change = Some(Instant::now());
+                        self.send(Command::SetRecordingsDir { path });
+                    }
+                }
+            }
+            Message::Send(c) => {
+                // Save itself doesn't dirty the state — everything else does.
+                if matches!(c, Command::Save) {
+                    self.dirty = false;
+                } else {
+                    self.dirty = true;
+                    self.last_change = Some(Instant::now());
+                }
+                self.send(c);
+            }
+            Message::Tick => {
+                if self.dirty {
+                    if let Some(t) = self.last_change {
+                        if t.elapsed() > AUTOSAVE_DEBOUNCE {
+                            self.send(Command::Save);
+                            self.dirty = false;
+                        }
+                    }
+                }
+            }
         }
         Task::none()
     }
 
     fn subscription(&self) -> Subscription<Message> {
         // Drain the link worker's channel on a timer and feed events in.
-        iced::time::every(std::time::Duration::from_millis(33)).map(|_| {
+        let poll = iced::time::every(std::time::Duration::from_millis(33)).map(|_| {
             let mut guard = LINK_RX.lock().unwrap();
             if let Some(rx) = guard.as_ref() {
                 if let Ok(ev) = rx.try_recv() {
@@ -105,7 +217,23 @@ impl App {
                 }
             }
             Message::Tick
-        })
+        });
+        let resize = iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size.width));
+        Subscription::batch([poll, resize])
+    }
+
+    /// Strip/bus card width for the current window: shrinks smoothly between
+    /// `STRIP_MAX` (roomy) and `STRIP_MIN` (compact) as the window narrows,
+    /// rather than clipping — below `STRIP_MIN` the console row scrolls
+    /// horizontally instead (see the `scrollable` wrapping it in `console()`).
+    fn strip_card_width(&self) -> f32 {
+        // Rough available width: window minus side padding/chrome. Doesn't
+        // need to be exact — it only picks a card size, the scrollable
+        // handles anything left over.
+        let available = self.window_width - 80.0;
+        let strips = self.state.as_ref().map(|s| s.strips.len()).unwrap_or(5).max(1) as f32;
+        let per_card = available / strips - 20.0; // card padding/gap allowance
+        per_card.clamp(tokens::layout::STRIP_MIN, tokens::layout::STRIP_MAX)
     }
 
     fn view(&self) -> Element<Message> {
@@ -114,6 +242,7 @@ impl App {
             Tab::Console => self.console(),
             Tab::Matrix => self.matrix(),
             Tab::Settings => self.settings(),
+            Tab::Log => self.log(),
         };
 
         container(column![header, body].spacing(0))
@@ -135,6 +264,7 @@ impl App {
             widgets::tab_button("CONSOLE", self.tab == Tab::Console).on_press(Message::Tab(Tab::Console)),
             widgets::tab_button("MATRIX", self.tab == Tab::Matrix).on_press(Message::Tab(Tab::Matrix)),
             widgets::tab_button("SETTINGS", self.tab == Tab::Settings).on_press(Message::Tab(Tab::Settings)),
+            widgets::tab_button("LOG", self.tab == Tab::Log).on_press(Message::Tab(Tab::Log)),
         ]
         .spacing(8);
 
@@ -147,12 +277,30 @@ impl App {
             row![text("● ").size(12).color(theme::REC_RED), text(self.status.clone()).size(11).color(theme::TEXT_DIM)]
         };
 
+        let save_label = if self.dirty { "● SAVE" } else { "SAVED" };
+        let save_fg = if self.dirty { theme::MIC_AMBER } else { theme::TEXT_DIM };
+        let save_btn = button(text(save_label).size(11).color(save_fg))
+            .style(move |_t, _s| iced::widget::button::Style {
+                background: Some(iced::Background::Color(if self.dirty {
+                    theme::with_alpha(theme::MIC_AMBER, 0.12)
+                } else {
+                    iced::Color::TRANSPARENT
+                })),
+                border: iced::Border { color: if self.dirty { theme::MIC_AMBER } else { theme::EDGE_SOFT }, width: 1.0, radius: 6.0.into() },
+                text_color: save_fg,
+                ..Default::default()
+            })
+            .padding([6, 12])
+            .on_press(Message::Send(Command::Save));
+
         container(
             row![
                 logo,
                 Space::with_width(24),
                 tabs,
                 Space::with_width(Length::Fill),
+                save_btn,
+                Space::with_width(16),
                 status,
             ]
             .spacing(8)
@@ -181,17 +329,38 @@ impl App {
             }
         }
 
+        let card_w = self.strip_card_width();
+        let renaming_strip = |idx: usize| match &self.renaming {
+            Some((RenameTarget::Strip(i), draft)) if *i == idx => Some(draft.as_str()),
+            _ => None,
+        };
+        let renaming_bus = |idx: usize| match &self.renaming {
+            Some((RenameTarget::Bus(i), draft)) if *i == idx => Some(draft.as_str()),
+            _ => None,
+        };
+
         // Input strips (sources).
         let mut strips = row![].spacing(10);
         for (i, s) in state.strips.iter().enumerate() {
-            strips = strips.push(widgets::strip_card(i, s, state));
+            strips = strips.push(widgets::strip_card(i, s, state, card_w, renaming_strip(i)));
         }
+        let add_strip = button(text("+").size(16).color(theme::TEXT_DIM).center().width(Length::Fill))
+            .style(|_t, _s| iced::widget::button::Style {
+                background: Some(iced::Background::Color(theme::CARD_LO)),
+                border: iced::Border { color: theme::EDGE_SOFT, width: 1.0, radius: 8.0.into() },
+                text_color: theme::TEXT_DIM,
+                ..Default::default()
+            })
+            .width(Length::Fixed(44.0))
+            .height(Length::Fixed(300.0))
+            .on_press(Message::Send(Command::AddStrip));
+        strips = strips.push(add_strip);
 
         // Virtual mic buses (B), on the right.
         let mut buses = row![].spacing(10);
         for (i, b) in state.buses.iter().enumerate() {
             if b.kind == BusKind::VirtualMic {
-                buses = buses.push(widgets::bus_card(i, b, state));
+                buses = buses.push(widgets::bus_card(i, b, state, card_w, renaming_bus(i)));
             }
         }
 
@@ -211,6 +380,12 @@ impl App {
         .spacing(4)
         .padding(16);
 
+        // Horizontal scroll-on-overflow isn't viable here: several rows in
+        // this content (e.g. `labels`) intentionally use Length::Fill space
+        // to right-align a label, and Iced panics if scrollable content fills
+        // the axis it scrolls. Card-shrinking (`strip_card_width`) covers the
+        // common case instead; below STRIP_MIN, cards stay at STRIP_MIN and
+        // rely on window resize rather than a horizontal scrollbar.
         scrollable(console).width(Length::Fill).height(Length::Fill).into()
     }
 
@@ -225,6 +400,13 @@ impl App {
         let Some(state) = &self.state else {
             return container(text("waiting for daemon…").color(theme::TEXT_DIM)).padding(40).into();
         };
-        widgets::settings_view(state)
+        widgets::settings_view(state, self.recdir_draft.as_deref())
+    }
+
+    fn log(&self) -> Element<Message> {
+        let Some(state) = &self.state else {
+            return container(text("waiting for daemon…").color(theme::TEXT_DIM)).padding(40).into();
+        };
+        widgets::log_view(state)
     }
 }

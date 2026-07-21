@@ -59,46 +59,61 @@ systemctl --user restart ferromix
 pw-cli ls Node | grep -i ferromix    # expect ONE node per bus, no "-1" copies
 ```
 
-## Ubuntu / Debian
+## Fedora
 
 ```sh
-sudo apt install libpipewire-0.3-dev clang pkg-config build-essential
+sudo dnf install rust cargo clang-devel pkgconf-pkg-config pipewire-devel ladspa-swh-plugins
 cargo build --release
 
 # install
-sudo install -Dm755 target/release/ferromix-daemon /usr/local/bin/
-sudo install -Dm755 target/release/ferromix-gui    /usr/local/bin/
-install -Dm644 packaging/ferromix.service ~/.config/systemd/user/ferromix.service
+sudo install -Dm755 target/release/ferromix2-daemon /usr/bin/
+sudo install -Dm755 target/release/ferromix2        /usr/bin/
+install -Dm644 packaging/ferromix2.service ~/.config/systemd/user/ferromix2.service
 systemctl --user daemon-reload
-systemctl --user enable --now ferromix
+systemctl --user enable --now ferromix2
 
-ferromix-gui        # badge reads LIVE when it's talking to the daemon
+ferromix2            # badge reads LIVE when it's talking to the daemon
 ```
 
 Check it's alive:
 ```sh
-systemctl --user status ferromix
-journalctl --user -u ferromix -f      # live log
-pw-cli ls Node | grep -i ferromix     # your buses + virtual input
+systemctl --user status ferromix2
+journalctl --user -u ferromix2 -f      # live log
+pw-cli ls Node | grep -i ferromix      # your buses + virtual input
 ```
 
 Then in each app: point **Discord's input** at `FerroMix B1`, your **softphone's
 input** at `FerroMix B2`, and pick a real device for A1 in the GUI.
 
-Arch: swap the deps for `pipewire clang pkgconf`.
+Ubuntu/Debian: swap the deps for `libpipewire-0.3-dev clang pkg-config build-essential`.
+Arch: swap the deps for `pipewire clang pkgconf`, or use `packaging/PKGBUILD`.
 
-## Windows (GUI development only)
+The gate/compressor DSP on each strip needs `ladspa-swh-plugins` (or your
+distro's equivalent) installed at runtime for the compressor stage; the gate
+is a PipeWire builtin and needs nothing extra.
 
-Mock backend — fake mics, apps, devices, animated meters, and a SIP call that
-drops at 16 s and returns at 24 s so you can watch routes reattach:
-```powershell
-cargo run -p mixer-gui        # auto-mock off Linux
-cargo run -p mixer-gui -- --mock
+### Recommended: disable role-based loopback routing
+
+Fedora's default WirePlumber config routes PipeWire-pulse clients (Spotify,
+Firefox, most desktop apps) through role-based loopback sinks before FerroMix
+can claim them — FerroMix detects and redirects this after the fact (you'll
+see `REDIRECT` in the log), but it's strictly better to remove the race
+entirely:
+```sh
+mkdir -p ~/.config/wireplumber/wireplumber.conf.d
+cp packaging/wireplumber/91-ferromix-disable-role-loopbacks.conf \
+   ~/.config/wireplumber/wireplumber.conf.d/
+systemctl --user restart wireplumber wireplumber-pipewire pipewire pipewire-pulse
 ```
+This is optional and system-wide — it also turns off Fedora's role-based
+ducking (e.g. notification sounds ducking music) for every app, not just
+FerroMix. See the comment in that file for the full trade-off. FerroMix
+routes correctly either way; this just makes it proactive instead of reactive.
 
 ## Config
 
-`~/.config/ferromix/config.toml` — the GUI's `SAVE` writes it back.
+`~/.config/ferromix2/config.toml` — the header's SAVE indicator writes it back
+(autosaves ~1.5s after the last change, or click SAVE directly).
 
 ```toml
 feedback_guard = true
@@ -120,9 +135,9 @@ assign = ["A1", "B2"]    # buses this strip feeds
 ## Architecture
 
 `mixer-core` (model/engine/config/IPC/mock) · `mixer-pw` (PipeWire: devices,
-declarative link reconciler, VU taps, recorder) · `mixer-daemon`
-(`ferromix-daemon`, owns the graph, serves GUIs over a Unix socket) ·
-`mixer-gui` (`ferromix-gui`, egui console + matrix).
+declarative link reconciler, VU taps, recorder, per-strip DSP) · `mixer-daemon`
+(`ferromix2-daemon`, owns the graph, serves GUIs over a Unix socket) ·
+`mixer-gui-iced` (`ferromix2`, Iced console + matrix + settings + log).
 
 The daemon owns audio; the GUI is disposable. Close it, audio keeps flowing.
 See `docs/ARCHITECTURE.md`.

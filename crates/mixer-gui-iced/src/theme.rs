@@ -3,7 +3,13 @@
 //! legible: A (hardware) reads cyan, B (virtual mic) reads violet, danger reads
 //! coral, and everything else stays quiet.
 
-use iced::{Background, Border, Color, Shadow, Vector};
+use iced::{Background, Border, Color, Font, Shadow, Vector};
+
+/// The bundled UI typeface (see `assets/fonts/`, embedded in `main.rs`).
+/// Everything except the pw-metadata code snippet in Settings uses this.
+pub const FONT_UI: Font = Font::with_name("Inter");
+/// Semibold weight, for headers/wordmark where a touch more presence helps.
+pub const FONT_UI_SEMIBOLD: Font = Font { weight: iced::font::Weight::Semibold, ..FONT_UI };
 
 pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::from_rgb(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)

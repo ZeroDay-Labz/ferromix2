@@ -18,7 +18,7 @@ mod dsp;
 mod worker;
 
 use mixer_core::backend::{AudioBackend, BackendEvent, BackendResult};
-use mixer_core::model::{BusKind, RecTarget};
+use mixer_core::model::{BusKind, RecTarget, StripDsp};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
@@ -29,6 +29,7 @@ pub(crate) enum PwCmd {
     SetStripVolume { idx: usize, volume: f32 },
     SetStripMute { idx: usize, mute: bool },
     SetStripAssign { idx: usize, bus: usize, on: bool },
+    SetStripDsp { idx: usize, dsp: StripDsp },
     SetFeedbackGuard { on: bool },
     SetDefaultOutput { idx: usize },
     SetDefaultInput { idx: usize },
@@ -82,6 +83,9 @@ impl AudioBackend for PwBackend {
     }
     fn set_strip_assign(&mut self, idx: usize, bus_idx: usize, on: bool) -> BackendResult {
         self.send(PwCmd::SetStripAssign { idx, bus: bus_idx, on })
+    }
+    fn set_strip_dsp(&mut self, idx: usize, dsp: StripDsp) -> BackendResult {
+        self.send(PwCmd::SetStripDsp { idx, dsp })
     }
     fn set_feedback_guard(&mut self, on: bool) -> BackendResult {
         self.send(PwCmd::SetFeedbackGuard { on })

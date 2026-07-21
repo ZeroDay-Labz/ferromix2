@@ -4,7 +4,6 @@ members = [
     "crates/mixer-core",
     "crates/mixer-pw",
     "crates/mixer-daemon",
-    "crates/mixer-gui",
     "crates/mixer-gui-iced",
 ]
 

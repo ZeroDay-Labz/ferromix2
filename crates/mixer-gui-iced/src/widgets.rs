@@ -2,15 +2,17 @@
 //! draggable DSP knobs, device/app dropdowns, and the send grid.
 
 use crate::theme;
+use crate::tokens;
 use crate::Message;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
-use iced::widget::{button, column, container, mouse_area, pick_list, row, scrollable, text, vertical_slider, Space};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Border, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme};
+use crate::RenameTarget;
 use mixer_core::engine::Command;
-use mixer_core::model::{pos_to_db, Bus, BusKind, MixerState, Strip, StripDsp};
+use mixer_core::model::{pos_to_db, Bus, BusKind, MixerState, RecTarget, Strip, StripDsp};
 
-pub const STRIP_W: f32 = 150.0;
 const FADER_H: f32 = 150.0;
+const FADER_W: f32 = 20.0;
 
 pub fn tab_button(label: &str, active: bool) -> button::Button<'_, Message> {
     let fg = if active { theme::ACCENT } else { theme::TEXT_DIM };
@@ -33,6 +35,43 @@ fn send_pill<'a>(label: &'a str, on: bool, fb: bool, is_b: bool, msg: Message) -
         .width(Length::Fixed(38.0)).padding([4, 0]).on_press(msg).into()
 }
 
+/// The click-to-rename header used by both strip and bus cards: plain text
+/// that becomes a text field on click, committed on Enter.
+fn rename_head<'a>(name: String, renaming: Option<&'a str>, target: RenameTarget, size: u16, accent: Color, trailing: Element<'a, Message>) -> Element<'a, Message> {
+    if let Some(draft) = renaming {
+        text_input("name", draft)
+            .on_input(Message::RenameChanged)
+            .on_submit(Message::RenameSubmit)
+            .size(size)
+            .padding(tokens::space::XS)
+            .style(move |_t, _s| text_input::Style {
+                background: iced::Background::Color(theme::PANEL_HI),
+                border: Border { color: accent, width: 1.0, radius: tokens::radius::SM.into() },
+                icon: theme::TEXT_DIM,
+                placeholder: theme::TEXT_DIM,
+                value: theme::TEXT,
+                selection: theme::with_alpha(accent, 0.35),
+            })
+            .into()
+    } else {
+        let label = button(text(elide(&name, 14)).size(size).color(theme::TEXT))
+            .style(|_t, _s| button::Style { background: None, text_color: theme::TEXT, ..Default::default() })
+            .padding(0)
+            .on_press(Message::RenameStart(target, name));
+        row![label, Space::with_width(Length::Fill), trailing].align_y(Alignment::Center).into()
+    }
+}
+
+/// REC arm toggle — same visual language as MUTE, but red-on when armed.
+fn rec_button<'a>(recording: bool, target: RecTarget) -> Element<'a, Message> {
+    let msg = if recording {
+        Message::Send(Command::StopRecordTarget { target })
+    } else {
+        Message::Send(Command::StartRecordTarget { target })
+    };
+    wide_button(if recording { "■ STOP" } else { "● REC" }, recording, theme::REC_RED, msg)
+}
+
 fn wide_button<'a>(label: &'a str, on: bool, accent: Color, msg: Message) -> Element<'a, Message> {
     let (bg, fg) = if on { (accent, theme::BG_DEEP) } else { (theme::PANEL_HI, theme::TEXT_DIM) };
     button(text(label).size(10).color(fg).center().width(Length::Fill))
@@ -40,32 +79,117 @@ fn wide_button<'a>(label: &'a str, on: bool, accent: Color, msg: Message) -> Ele
         .width(Length::Fill).padding([6, 0]).on_press(msg).into()
 }
 
-fn fader<'a>(value: f32, accent: Color, unity: f32, on_change: impl Fn(f32) -> Message + 'a + Copy) -> Element<'a, Message> {
-    let slider = vertical_slider(0.0..=1.0, value, move |v| on_change(v))
-        .step(0.001).height(Length::Fixed(FADER_H))
-        .style(move |_t, _s| slider_style(accent));
-    // Scroll to nudge; right-click to snap back to unity (0.0 dB).
-    mouse_area(slider)
-        .on_scroll(move |delta| {
-            let dy = match delta { iced::mouse::ScrollDelta::Lines { y, .. } => y, iced::mouse::ScrollDelta::Pixels { y, .. } => y / 40.0 };
-            on_change((value + dy * 0.02).clamp(0.0, 1.0))
-        })
-        .on_right_press(on_change(unity))
-        .into()
+/// A canvas-drawn vertical fader: rounded cap, glow rail below the handle,
+/// matching the DSP `Dial`'s visual language. Click/drag to set, scroll to
+/// nudge, right-click to reset to unity (0.0 dB) — same interaction model as
+/// before, just hand-drawn instead of a restyled built-in slider.
+struct FaderCap<F> {
+    value: f32,
+    accent: Color,
+    unity: f32,
+    on_change: F,
 }
 
-fn slider_style(accent: Color) -> vertical_slider::Style {
-    use iced::widget::slider::{Handle, HandleShape, Rail};
-    vertical_slider::Style {
-        rail: Rail {
-            backgrounds: (iced::Background::Color(accent), iced::Background::Color(theme::BG_DEEP)),
-            width: 5.0, border: Border { color: theme::EDGE, width: 1.0, radius: 3.0.into() },
-        },
-        handle: Handle {
-            shape: HandleShape::Rectangle { width: 26, border_radius: 4.0.into() },
-            background: iced::Background::Color(theme::PANEL_HI), border_color: accent, border_width: 1.5,
-        },
+impl<F: Fn(f32) -> Message> FaderCap<F> {
+    fn emit(&self, v: f32) -> Message {
+        (self.on_change)(v.clamp(0.0, 1.0))
     }
+    fn value_at(&self, bounds: Rectangle, y: f32) -> f32 {
+        (1.0 - (y - bounds.y) / bounds.height).clamp(0.0, 1.0)
+    }
+}
+
+impl<F: Fn(f32) -> Message> canvas::Program<Message> for FaderCap<F> {
+    type State = bool; // dragging?
+
+    fn update(
+        &self,
+        state: &mut Self::State,
+        event: canvas::Event,
+        bounds: Rectangle,
+        cursor: iced::mouse::Cursor,
+    ) -> (canvas::event::Status, Option<Message>) {
+        use canvas::event::{self, Event};
+        use iced::mouse::{self, Button};
+        let inside = cursor.is_over(bounds);
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(Button::Left)) if inside => {
+                *state = true;
+                let Some(pos) = cursor.position() else { return (event::Status::Ignored, None) };
+                (event::Status::Captured, Some(self.emit(self.value_at(bounds, pos.y))))
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) if *state => {
+                let Some(pos) = cursor.position() else { return (event::Status::Ignored, None) };
+                (event::Status::Captured, Some(self.emit(self.value_at(bounds, pos.y))))
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(Button::Left)) => {
+                *state = false;
+                (event::Status::Ignored, None)
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) if inside => {
+                let dy = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => y,
+                    mouse::ScrollDelta::Pixels { y, .. } => y / 40.0,
+                };
+                (event::Status::Captured, Some(self.emit(self.value + dy * 0.02)))
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(Button::Right)) if inside => {
+                (event::Status::Captured, Some(self.emit(self.unity)))
+            }
+            _ => (event::Status::Ignored, None),
+        }
+    }
+
+    fn draw(&self, _s: &Self::State, r: &Renderer, _t: &Theme, b: Rectangle, _c: iced::mouse::Cursor) -> Vec<Geometry> {
+        let mut f = Frame::new(r, b.size());
+        let rail_w = 5.0;
+        let cx = b.width / 2.0;
+        let rail_x = cx - rail_w / 2.0;
+
+        // Track.
+        f.fill(&Path::rectangle(Point::new(rail_x, 0.0), Size::new(rail_w, b.height)), theme::BG_DEEP);
+        f.stroke(
+            &Path::rounded_rectangle(Point::new(rail_x, 0.0), Size::new(rail_w, b.height), 3.0.into()),
+            Stroke::default().with_color(theme::EDGE).with_width(1.0),
+        );
+
+        let v = self.value.clamp(0.0, 1.0);
+        let handle_y = b.height * (1.0 - v);
+
+        // Glow fill from the handle down to the bottom (louder = more lit rail).
+        let fill_h = b.height - handle_y;
+        if fill_h > 0.5 {
+            f.fill(
+                &Path::rectangle(Point::new(rail_x, handle_y), Size::new(rail_w, fill_h)),
+                theme::with_alpha(self.accent, 0.85),
+            );
+        }
+
+        // Handle: rounded cap with a subtle top highlight, bordered in accent.
+        let handle_h = 22.0_f32.min(b.height);
+        let handle_w = b.width.min(26.0);
+        let handle_top = (handle_y - handle_h / 2.0).clamp(0.0, (b.height - handle_h).max(0.0));
+        let handle_rect = Path::rounded_rectangle(
+            Point::new(cx - handle_w / 2.0, handle_top),
+            Size::new(handle_w, handle_h),
+            4.0.into(),
+        );
+        f.fill(&handle_rect, theme::PANEL_HI);
+        f.stroke(&handle_rect, Stroke::default().with_color(self.accent).with_width(1.5));
+        f.fill(
+            &Path::rectangle(Point::new(cx - handle_w / 2.0 + 3.0, handle_top + 3.0), Size::new(handle_w - 6.0, 2.5)),
+            theme::with_alpha(theme::TEXT, 0.3),
+        );
+
+        vec![f.into_geometry()]
+    }
+}
+
+fn fader<'a>(value: f32, accent: Color, unity: f32, on_change: impl Fn(f32) -> Message + 'a) -> Element<'a, Message> {
+    Canvas::new(FaderCap { value, accent, unity, on_change })
+        .width(Length::Fixed(FADER_W))
+        .height(Length::Fixed(FADER_H))
+        .into()
 }
 
 pub fn fmt_db(pos: f32) -> String {
@@ -189,16 +313,40 @@ impl<M> canvas::Program<M> for Meter {
     type State = ();
     fn draw(&self, _s: &(), r: &Renderer, _t: &Theme, b: Rectangle, _c: iced::mouse::Cursor) -> Vec<Geometry> {
         let mut f = Frame::new(r, b.size());
-        f.fill(&Path::rectangle(Point::ORIGIN, b.size()), theme::SEG_OFF);
-        let segs = 20; let lit = (self.level.clamp(0.0, 1.0) * segs as f32).round() as i32; let sh = b.height / segs as f32;
+        f.fill(&Path::rounded_rectangle(Point::ORIGIN, b.size(), 3.0.into()), theme::SEG_OFF);
+        let segs = 20;
+        let lit = (self.level.clamp(0.0, 1.0) * segs as f32).round() as i32;
+        let sh = b.height / segs as f32;
+        // Topmost lit segment = the loudest one; give it a soft bloom (a wider,
+        // dimmer underlay) so the peak reads at a glance instead of just being
+        // "one more solid block".
+        let peak_i = segs - lit;
         for i in 0..segs {
             if i as i32 >= segs as i32 - lit {
                 let frac = (segs - 1 - i) as f32 / segs as f32;
                 let col = if frac > 0.85 { theme::METER_HI } else if frac > 0.6 { theme::METER_MID } else { theme::METER_LO };
-                f.fill(&Path::rectangle(Point::new(1.0, i as f32 * sh + 0.5), Size::new(b.width - 2.0, sh - 1.0)), col);
+                let seg = Path::rounded_rectangle(
+                    Point::new(1.5, i as f32 * sh + 0.75),
+                    Size::new(b.width - 3.0, sh - 1.5),
+                    1.5.into(),
+                );
+                if i as i32 == peak_i {
+                    f.fill(
+                        &Path::rounded_rectangle(
+                            Point::new(0.0, i as f32 * sh - 1.0),
+                            Size::new(b.width, sh + 2.0),
+                            2.5.into(),
+                        ),
+                        theme::with_alpha(col, 0.35),
+                    );
+                }
+                f.fill(&seg, col);
             }
         }
-        f.stroke(&Path::rectangle(Point::ORIGIN, b.size()), Stroke::default().with_color(theme::with_alpha(self.accent, 0.4)).with_width(1.0));
+        f.stroke(
+            &Path::rounded_rectangle(Point::ORIGIN, b.size(), 3.0.into()),
+            Stroke::default().with_color(theme::with_alpha(self.accent, 0.4)).with_width(1.0),
+        );
         vec![f.into_geometry()]
     }
 }
@@ -214,13 +362,10 @@ fn dropdown<'a>(placeholder: &'a str, options: Vec<Opt>, selected: Option<Opt>, 
         .into()
 }
 
-pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState) -> Element<'a, Message> {
+pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState, width: f32, renaming: Option<&'a str>) -> Element<'a, Message> {
     let accent = theme::ACCENT;
-    let head = row![
-        text(elide(&strip.display_name(idx), 14)).size(11).color(if strip.input_live { theme::TEXT } else { theme::TEXT_DIM }),
-        Space::with_width(Length::Fill),
-        text(if strip.input_live { "●" } else { "○" }).size(8).color(if strip.input_live { accent } else { theme::TEXT_DIM }),
-    ].align_y(Alignment::Center);
+    let live_dot = text(if strip.input_live { "●" } else { "○" }).size(8).color(if strip.input_live { accent } else { theme::TEXT_DIM });
+    let head = rename_head(strip.display_name(idx), renaming, RenameTarget::Strip(idx), 11, accent, live_dot.into());
     let opts: Vec<Opt> = state.inputs.iter().map(|i| Opt { key: i.key.clone(), label: i.label.clone() }).collect();
     let sel = strip.input.as_ref().and_then(|k| opts.iter().find(|o| &o.key == k).cloned());
     let input_dd = dropdown("— select source —", opts, sel, move |o: Opt| Message::Send(Command::SetStripInput { strip: idx, input: Some(o.key) }));
@@ -238,6 +383,7 @@ pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState) -> El
     let dsp = strip.dsp;
     let knobs = row![knob("GATE", dsp.gate, dsp.gate_on, theme::ACCENT, idx, dsp, true), Space::with_width(6), knob("COMP", dsp.comp, dsp.comp_on, theme::VIOLET, idx, dsp, false)];
     let mute = wide_button("MUTE", strip.mute, theme::REC_RED, Message::Send(Command::SetStripMute { strip: idx, mute: !strip.mute }));
+    let rec = rec_button(strip.recording, RecTarget::Strip(idx));
     // SET AS DEFAULT: make this strip the system default output, so any app on
     // "default" (e.g. Spotify) flows into it automatically. This is how you get
     // "all my desktop audio through one strip" without configuring each app.
@@ -248,15 +394,16 @@ pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState) -> El
         theme::MIC_AMBER,
         Message::Send(Command::SetDefaultOutput { strip: idx }),
     );
-    let body = column![head, Space::with_height(5), input_dd, Space::with_height(8), fader_row, Space::with_height(8), column![a_row, b_row].spacing(3), Space::with_height(8), knobs, Space::with_height(8), mute, Space::with_height(4), default_btn]
-        .spacing(0).width(Length::Fixed(STRIP_W));
-    container(body).padding(10).width(Length::Fixed(STRIP_W + 20.0)).style(theme::card_accent(if strip.input_live { accent } else { theme::EDGE_SOFT })).into()
+    let body = column![head, Space::with_height(5), input_dd, Space::with_height(8), fader_row, Space::with_height(8), column![a_row, b_row].spacing(3), Space::with_height(8), knobs, Space::with_height(8), row![mute, Space::with_width(4), rec].spacing(0), Space::with_height(4), default_btn]
+        .spacing(0).width(Length::Fixed(width));
+    container(body).padding(10).width(Length::Fixed(width + 20.0)).style(theme::card_accent(if strip.input_live { accent } else { theme::EDGE_SOFT })).into()
 }
 
-pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState) -> Element<'a, Message> {
+pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState, width: f32, renaming: Option<&'a str>) -> Element<'a, Message> {
     let accent = theme::VIOLET;
     let name = if bus.name.is_empty() { bus.label.clone() } else { bus.name.clone() };
-    let head = row![text(name).size(14).color(accent), Space::with_width(Length::Fill), text("MIC").size(8).color(theme::TEXT_DIM)].align_y(Alignment::Center);
+    let mic_tag = text("MIC").size(8).color(theme::TEXT_DIM);
+    let head = rename_head(name, renaming, RenameTarget::Bus(idx), 14, accent, mic_tag.into());
     let opts: Vec<Opt> = state.capture_apps.iter().map(|a| Opt { key: a.key.clone(), label: a.label.clone() }).collect();
     let sel = bus.listener.as_ref().and_then(|k| opts.iter().find(|o| &o.key == k).cloned());
     let app_dd = dropdown("◇ SEND TO APP", opts, sel, move |o: Opt| Message::Send(Command::SetBusListener { bus: idx, app: Some(o.key) }));
@@ -271,6 +418,7 @@ pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState) -> Element<
         mon = mon.push(send_pill(&ab.label, on, false, false, Message::Send(Command::ToggleBusMonitor { bus: idx, a_bus: ai })));
     }
     let mute = wide_button("MUTE", bus.mute, theme::REC_RED, Message::Send(Command::SetBusMute { bus: idx, mute: !bus.mute }));
+    let rec = rec_button(bus.recording, RecTarget::Bus(idx));
     // SET AS DEF MIC: make this virtual mic the system default input, so apps
     // on "default" microphone (e.g. browsers) transmit this bus's mix.
     let is_def_mic = state.default_input == Some(idx);
@@ -280,9 +428,9 @@ pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState) -> Element<
         theme::MIC_AMBER,
         Message::Send(Command::SetDefaultInput { bus: idx }),
     );
-    let body = column![head, Space::with_height(5), app_dd, Space::with_height(3), listening, Space::with_height(6), fader_row, Space::with_height(8), text("MONITOR ON").size(8).color(theme::TEXT_DIM), Space::with_height(2), mon, Space::with_height(8), mute, Space::with_height(4), def_mic_btn]
-        .spacing(0).width(Length::Fixed(STRIP_W));
-    container(body).padding(10).width(Length::Fixed(STRIP_W + 20.0)).style(theme::card_accent(accent)).into()
+    let body = column![head, Space::with_height(5), app_dd, Space::with_height(3), listening, Space::with_height(6), fader_row, Space::with_height(8), text("MONITOR ON").size(8).color(theme::TEXT_DIM), Space::with_height(2), mon, Space::with_height(8), row![mute, Space::with_width(4), rec].spacing(0), Space::with_height(4), def_mic_btn]
+        .spacing(0).width(Length::Fixed(width));
+    container(body).padding(10).width(Length::Fixed(width + 20.0)).style(theme::card_accent(accent)).into()
 }
 
 pub fn hw_out_slot<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState) -> Element<'a, Message> {
@@ -355,7 +503,7 @@ pub fn matrix_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
 
 // ─────────────────────────────────────────────────────── SETTINGS
 
-pub fn settings_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
+pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -> Element<'a, Message> {
     let section = |title: &'a str| text(title).size(11).color(theme::ACCENT);
 
     // Feedback guard toggle.
@@ -368,7 +516,7 @@ pub fn settings_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
     );
 
     let card = |content: Element<'a, Message>| {
-        container(content).padding(16).width(Length::Fixed(520.0)).style(theme::card)
+        container(content).padding(16).width(Length::Fill).max_width(640.0).style(theme::card)
     };
 
     let routing = card(
@@ -383,13 +531,72 @@ pub fn settings_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
         .into(),
     );
 
+    let recdir_value = recdir_draft.unwrap_or(state.recordings_dir.as_str());
+    let recdir_input = text_input("~/Music/ferromix2", recdir_value)
+        .on_input(Message::RecDirChanged)
+        .on_submit(Message::RecDirApply)
+        .size(10)
+        .padding(tokens::space::SM)
+        .style(|_t, _s| text_input::Style {
+            background: iced::Background::Color(theme::BG_DEEP),
+            border: Border { color: theme::EDGE, width: 1.0, radius: tokens::radius::SM.into() },
+            icon: theme::TEXT_DIM,
+            placeholder: theme::TEXT_DIM,
+            value: theme::TEXT,
+            selection: theme::with_alpha(theme::ACCENT, 0.35),
+        })
+        .width(Length::Fill);
+    let apply_btn = button(text("APPLY").size(9).color(theme::BG_DEEP).center())
+        .style(|_t, _s| button::Style {
+            background: Some(iced::Background::Color(theme::ACCENT)),
+            border: Border { color: theme::ACCENT, width: 1.0, radius: tokens::radius::SM.into() },
+            text_color: theme::BG_DEEP,
+            ..Default::default()
+        })
+        .padding([6, 10])
+        .on_press(Message::RecDirApply);
+
     let rec = card(
         column![
             section("RECORDING"),
             Space::with_height(8),
-            text(format!("Recordings folder:  {}", state.recordings_dir)).size(10).color(theme::TEXT),
+            row![recdir_input, Space::with_width(6), apply_btn].align_y(Alignment::Center),
             Space::with_height(4),
-            text("Each armed track writes its own WAV. Arm tracks from the record strip on the console.").size(9).color(theme::TEXT_DIM),
+            text("Each armed track writes its own WAV. Arm tracks with the REC button on a strip or bus card.").size(9).color(theme::TEXT_DIM),
+        ]
+        .spacing(0)
+        .into(),
+    );
+
+    let scale = if state.ui_scale > 0.0 { state.ui_scale } else { 1.0 };
+    let scale_pct = (scale * 100.0).round() as i32;
+    let step_btn = move |label: &'static str, delta: f32| -> Element<'a, Message> {
+        button(text(label).size(12).color(theme::TEXT).center().width(Length::Fill))
+            .style(|_t, _s| button::Style {
+                background: Some(iced::Background::Color(theme::PANEL_HI)),
+                border: Border { color: theme::EDGE, width: 1.0, radius: tokens::radius::SM.into() },
+                text_color: theme::TEXT,
+                ..Default::default()
+            })
+            .width(Length::Fixed(32.0))
+            .padding([4, 0])
+            .on_press(Message::Send(Command::SetUiScale { scale: (scale + delta).clamp(0.5, 3.0) }))
+            .into()
+    };
+    let display = card(
+        column![
+            section("DISPLAY"),
+            Space::with_height(8),
+            row![
+                step_btn("−", -0.1),
+                Space::with_width(10),
+                text(format!("{scale_pct}%")).size(12).color(theme::TEXT).width(Length::Fixed(48.0)),
+                Space::with_width(10),
+                step_btn("+", 0.1),
+            ]
+            .align_y(Alignment::Center),
+            Space::with_height(6),
+            text("UI scale. Persists across restarts.").size(9).color(theme::TEXT_DIM),
         ]
         .spacing(0)
         .into(),
@@ -429,6 +636,8 @@ pub fn settings_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
             Space::with_height(12),
             rec,
             Space::with_height(12),
+            display,
+            Space::with_height(12),
             latency,
             Space::with_height(12),
             about,
@@ -436,5 +645,30 @@ pub fn settings_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
         .spacing(0)
         .padding(20),
     )
+    .into()
+}
+
+// ─────────────────────────────────────────────────────── LOG
+
+/// Activity log — newest entries first, so the most recent routing/feedback/
+/// save events are visible without scrolling.
+pub fn log_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
+    let mut lines = column![].spacing(4);
+    for line in state.log.iter().rev() {
+        lines = lines.push(text(line).size(10).color(theme::TEXT_DIM).font(iced::Font::MONOSPACE));
+    }
+    let head = column![
+        text("ACTIVITY LOG").size(14).color(theme::TEXT),
+        text("Routing changes, feedback blocks, saves — newest first.").size(9).color(theme::TEXT_DIM),
+    ]
+    .spacing(4);
+
+    scrollable(
+        column![head, Space::with_height(16), container(lines).padding(12).width(Length::Fill).style(theme::card)]
+            .spacing(0)
+            .padding(20),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
     .into()
 }
