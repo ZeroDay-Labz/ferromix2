@@ -19,6 +19,12 @@ use std::time::{Duration, Instant};
 /// How long to wait after the last change before autosaving.
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(1500);
 
+/// How long the amber "you're interacting with this stack" outline stays lit
+/// after the last command sent for that strip/bus — a drag holds it on
+/// continuously (every `CursorMoved` re-sends a volume command, refreshing
+/// this), then it fades a beat after you let go, like a phosphor decay.
+const ACTIVE_HIGHLIGHT: Duration = Duration::from_millis(1100);
+
 /// Default window size — comfortable for the fixed-ish strip-card layout at
 /// startup. The window is resizable and has a real `min_size`; below the
 /// comfortable width, cards shrink (see `App::strip_card_width`) and the
@@ -90,6 +96,40 @@ struct App {
     /// Recordings-dir edit-in-progress text, if the user has started typing
     /// in the Settings field. `None` means "show `state.recordings_dir`".
     recdir_draft: Option<String>,
+    /// The strip/bus most recently touched by a command, and when — drives
+    /// the amber "active stack" outline. Cleared by `Tick` once it's decayed
+    /// past `ACTIVE_HIGHLIGHT`.
+    active: Option<(RenameTarget, Instant)>,
+}
+
+/// Which strip/bus a `Command` targets, for the active-stack highlight — a
+/// command that doesn't target one specific strip/bus (global settings,
+/// `Save`, `AddStrip`) yields `None` and leaves the highlight untouched by
+/// that message. Renaming isn't included here — it already has its own
+/// distinct visual feedback (the inline text field).
+fn command_target(c: &Command) -> Option<RenameTarget> {
+    use Command::*;
+    match *c {
+        SetStripInput { strip, .. }
+        | SetStripVolume { strip, .. }
+        | SetStripMute { strip, .. }
+        | SetStripDsp { strip, .. }
+        | SetStripListener { strip, .. } => Some(RenameTarget::Strip(strip)),
+        ToggleAssign { strip, .. } => Some(RenameTarget::Strip(strip)),
+        SetBusVolume { bus, .. }
+        | SetBusMute { bus, .. }
+        | SetBusDevice { bus, .. }
+        | SetBusInput { bus, .. }
+        | SetBusListener { bus, .. } => Some(RenameTarget::Bus(bus)),
+        ToggleBusMonitor { bus, .. } => Some(RenameTarget::Bus(bus)),
+        ToggleBusFeed { from, .. } => Some(RenameTarget::Bus(from)),
+        StartRecordTarget { target } | StopRecordTarget { target } => match target {
+            mixer_core::model::RecTarget::Strip(s) => Some(RenameTarget::Strip(s)),
+            mixer_core::model::RecTarget::Bus(b) => Some(RenameTarget::Bus(b)),
+        },
+        SetRecordingsDir { .. } | SetUiScale { .. } | SetStripName { .. } | SetBusName { .. }
+        | SetFeedbackGuard { .. } | AddStrip | Save => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +144,12 @@ enum Message {
     RenameCancel,
     RecDirChanged(String),
     RecDirApply,
+    CopyLog,
+    /// Restart PipeWire/WirePlumber/pipewire-pulse back to a clean, stock
+    /// state — the escape hatch for when something (e.g. a DSP module) has
+    /// left the live graph in a bad state that FerroMix itself can't recover
+    /// from. Same effect as running `reset_audio.sh`.
+    ResetAudio,
     Tick,
 }
 
@@ -123,6 +169,7 @@ impl App {
                 window_width: DEFAULT_WINDOW.0,
                 renaming: None,
                 recdir_draft: None,
+                active: None,
             },
             Task::none(),
         )
@@ -191,7 +238,29 @@ impl App {
                     self.dirty = true;
                     self.last_change = Some(Instant::now());
                 }
+                if let Some(target) = command_target(&c) {
+                    self.active = Some((target, Instant::now()));
+                }
                 self.send(c);
+            }
+            Message::CopyLog => {
+                if let Some(state) = &self.state {
+                    let text = state.log.join("\n");
+                    return iced::clipboard::write(text);
+                }
+            }
+            Message::ResetAudio => {
+                self.status = "resetting PipeWire/WirePlumber…".into();
+                // Fire-and-forget: restarting these services drops the
+                // daemon's PipeWire connection, which the existing
+                // reconnect-on-drop logic in `link.rs` already handles —
+                // no need to wait for or track completion here.
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "restart", "pipewire.socket", "pipewire-pulse.socket"])
+                    .spawn();
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "restart", "wireplumber.service"])
+                    .spawn();
             }
             Message::Tick => {
                 if self.dirty {
@@ -200,6 +269,11 @@ impl App {
                             self.send(Command::Save);
                             self.dirty = false;
                         }
+                    }
+                }
+                if let Some((_, t)) = self.active {
+                    if t.elapsed() > ACTIVE_HIGHLIGHT {
+                        self.active = None;
                     }
                 }
             }
@@ -344,11 +418,13 @@ impl App {
             Some((RenameTarget::Bus(i), draft)) if *i == idx => Some(draft.as_str()),
             _ => None,
         };
+        let is_active_strip = |idx: usize| matches!(self.active, Some((RenameTarget::Strip(i), _)) if i == idx);
+        let is_active_bus = |idx: usize| matches!(self.active, Some((RenameTarget::Bus(i), _)) if i == idx);
 
         // Input strips (sources).
         let mut strips = row![].spacing(10);
         for (i, s) in state.strips.iter().enumerate() {
-            strips = strips.push(widgets::strip_card(i, s, state, card_w, renaming_strip(i)));
+            strips = strips.push(widgets::strip_card(i, s, state, card_w, renaming_strip(i), is_active_strip(i)));
         }
         let add_strip = button(text("+").size(16).color(theme::TEXT_DIM).center().width(Length::Fill))
             .style(|_t, _s| iced::widget::button::Style {
@@ -366,7 +442,7 @@ impl App {
         let mut buses = row![].spacing(10);
         for (i, b) in state.buses.iter().enumerate() {
             if b.kind == BusKind::VirtualMic {
-                buses = buses.push(widgets::bus_card(i, b, state, card_w, renaming_bus(i)));
+                buses = buses.push(widgets::bus_card(i, b, state, card_w, renaming_bus(i), is_active_bus(i)));
             }
         }
 

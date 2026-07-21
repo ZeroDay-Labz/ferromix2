@@ -9,6 +9,8 @@ pub enum BackendEvent {
     DevicesChanged(Vec<Device>),
     /// (bus idx, apps capturing from it) — who is actually listening to a B bus.
     BusListeners(Vec<(usize, Vec<String>)>),
+    /// (strip idx, apps capturing from it) — same as `BusListeners`, for strips.
+    StripListeners(Vec<(usize, Vec<String>)>),
     /// Apps with a live capture (microphone) stream — assignable to a B bus.
     CaptureAppsChanged(Vec<SourceInfo>),
     BusReady { idx: usize, id: u32 },
@@ -57,6 +59,13 @@ pub trait AudioBackend: Send {
     /// whatever strips send to it. Global bus indices on both sides.
     fn set_bus_feed(&mut self, from: usize, to: usize, on: bool) -> BackendResult;
 
+    /// Route bus `bus`'s output additionally into strip `strip`'s device —
+    /// the reverse direction of `set_strip_assign`. A strip's meter stays
+    /// pre-fader/source-only regardless (see `sync_prefader_tap`), so audio
+    /// arriving this way never makes a strip's meter move — only its own
+    /// assigned `input` does.
+    fn set_bus_strip_feed(&mut self, bus: usize, strip: usize, on: bool) -> BackendResult;
+
     /// Pick which source bus `idx`'s METER tracks — pre-fader, source-only.
     /// `None` clears it (silent meter). Unlike `set_strip_input`, this is
     /// metering-only: it does NOT link the source's audio into the bus's mix
@@ -67,6 +76,13 @@ pub trait AudioBackend: Send {
     /// Point an app's MICROPHONE at bus `bus_idx` — i.e. make Discord listen to
     /// B1 without opening Discord's settings. `None` releases the app.
     fn set_bus_listener(&mut self, bus_idx: usize, app_key: Option<String>) -> BackendResult;
+
+    /// Same as `set_bus_listener`, for a strip — any strip can also be an
+    /// app's microphone source, not just B-buses (full strip/bus symmetry:
+    /// both can receive from an app via input, and send to an app via
+    /// listener, so audio can be routed app-to-app like a hardware mixer
+    /// routes across devices).
+    fn set_strip_listener(&mut self, idx: usize, app_key: Option<String>) -> BackendResult;
 
     /// Record any strip or bus to its own WAV.
     fn start_record(&mut self, target: RecTarget, path: PathBuf) -> BackendResult;

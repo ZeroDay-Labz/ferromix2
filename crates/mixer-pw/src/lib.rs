@@ -37,8 +37,10 @@ pub(crate) enum PwCmd {
     SetBusMute { idx: usize, mute: bool },
     SetBusMonitor { bus: usize, a_bus: usize, on: bool },
     SetBusFeed { from: usize, to: usize, on: bool },
+    SetBusStripFeed { bus: usize, strip: usize, on: bool },
     SetBusInput { idx: usize, source_key: Option<String> },
     SetBusListener { bus: usize, app_key: Option<String> },
+    SetStripListener { idx: usize, app_key: Option<String> },
     StartRecord { target: RecTarget, path: PathBuf },
     StopRecord { target: RecTarget },
 }
@@ -108,11 +110,17 @@ impl AudioBackend for PwBackend {
     fn set_bus_feed(&mut self, from: usize, to: usize, on: bool) -> BackendResult {
         self.send(PwCmd::SetBusFeed { from, to, on })
     }
+    fn set_bus_strip_feed(&mut self, bus: usize, strip: usize, on: bool) -> BackendResult {
+        self.send(PwCmd::SetBusStripFeed { bus, strip, on })
+    }
     fn set_bus_input(&mut self, idx: usize, source_key: Option<String>) -> BackendResult {
         self.send(PwCmd::SetBusInput { idx, source_key })
     }
     fn set_bus_listener(&mut self, bus_idx: usize, app_key: Option<String>) -> BackendResult {
         self.send(PwCmd::SetBusListener { bus: bus_idx, app_key })
+    }
+    fn set_strip_listener(&mut self, idx: usize, app_key: Option<String>) -> BackendResult {
+        self.send(PwCmd::SetStripListener { idx, app_key })
     }
     fn start_record(&mut self, target: RecTarget, path: PathBuf) -> BackendResult {
         self.send(PwCmd::StartRecord { target, path })

@@ -34,7 +34,14 @@ pub enum Command {
     /// (no-op) if `to` already feeds `from` — direct 2-cycles only are
     /// guarded against; longer chains are not, by design (see plan notes).
     ToggleBusFeed { from: usize, to: usize },
+    /// Route bus `bus`'s output additionally into strip `strip`'s device —
+    /// the reverse direction of `ToggleAssign`. Refused (no-op) if that strip
+    /// already sends to this bus (a direct strip→bus→strip cycle).
+    ToggleBusStripFeed { bus: usize, strip: usize },
     SetBusListener { bus: usize, app: Option<String> },
+    /// Same as `SetBusListener`, for a strip — see `Strip.listener`'s doc
+    /// comment for why strips can do this too, not just B-buses.
+    SetStripListener { strip: usize, app: Option<String> },
     StartRecordTarget { target: RecTarget },
     StopRecordTarget { target: RecTarget },
     SetFeedbackGuard { on: bool },
@@ -81,6 +88,7 @@ fn initial_state(cfg: &Config) -> MixerState {
             name: b.name.clone(),
             monitor: Vec::new(),
             feeds: Vec::new(),
+            strip_feeds: Vec::new(),
             input: b.input.clone(),
             input_label: b.input.clone().unwrap_or_else(|| "—".into()),
             input_live: false,
@@ -97,10 +105,12 @@ fn initial_state(cfg: &Config) -> MixerState {
         .collect();
     let n_a = buses.iter().filter(|b| b.kind == BusKind::HwOutput).count();
     let n_bus = buses.len();
+    let n_strips = cfg.strip_count.max(cfg.strips.len());
     let mut buses = buses;
     for b in buses.iter_mut() {
         b.monitor = vec![false; n_a];
         b.feeds = vec![false; n_bus];
+        b.strip_feeds = vec![false; n_strips];
     }
     // restore saved monitor flags by A-bus label
     let a_labels: Vec<String> = cfg
@@ -127,6 +137,11 @@ fn initial_state(cfg: &Config) -> MixerState {
                     }
                 }
             }
+            for &si in bcfg.strip_feeds.iter() {
+                if let Some(slot) = b.strip_feeds.get_mut(si) {
+                    *slot = true;
+                }
+            }
         }
     }
     let n = buses.len();
@@ -147,6 +162,8 @@ fn initial_state(cfg: &Config) -> MixerState {
                 assign,
                 recording: false,
                 dsp: crate::model::StripDsp::default(),
+                listener: s.listener.clone(),
+                listeners: Vec::new(),
             }
         })
         .collect();
@@ -261,6 +278,9 @@ fn run(
         }
         for (i, s) in st.strips.iter().enumerate() {
             push_strip(backend, i, s);
+            if s.listener.is_some() {
+                let _ = backend.set_strip_listener(i, s.listener.clone());
+            }
         }
         for (bi, b) in st.buses.iter().enumerate() {
             if b.input.is_some() {
@@ -277,6 +297,11 @@ fn run(
             for (gi, on) in b.feeds.iter().enumerate() {
                 if *on {
                     let _ = backend.set_bus_feed(bi, gi, true);
+                }
+            }
+            for (si, on) in b.strip_feeds.iter().enumerate() {
+                if *on {
+                    let _ = backend.set_bus_strip_feed(bi, si, true);
                 }
             }
         }
@@ -320,11 +345,17 @@ fn run(
                         .into_iter()
                         .map(|s| InputOption { key: s.key, label: s.label, kind: s.kind, live: true })
                         .collect();
-                    // Re-assert any bus listener whose app just (re)appeared.
+                    // Re-assert any bus/strip listener whose app just (re)appeared.
                     let buses = st.buses.clone();
                     for (i, b) in buses.iter().enumerate() {
                         if b.listener.is_some() {
                             let _ = backend.set_bus_listener(i, b.listener.clone());
+                        }
+                    }
+                    let strips = st.strips.clone();
+                    for (i, s) in strips.iter().enumerate() {
+                        if s.listener.is_some() {
+                            let _ = backend.set_strip_listener(i, s.listener.clone());
                         }
                     }
                 }
@@ -335,6 +366,16 @@ fn run(
                     for (idx, apps) in list {
                         if let Some(b) = st.buses.get_mut(idx) {
                             b.listeners = apps;
+                        }
+                    }
+                }
+                BackendEvent::StripListeners(list) => {
+                    for s in st.strips.iter_mut() {
+                        s.listeners.clear();
+                    }
+                    for (idx, apps) in list {
+                        if let Some(s) = st.strips.get_mut(idx) {
+                            s.listeners = apps;
                         }
                     }
                 }
@@ -528,6 +569,19 @@ fn run(
                     ));
                     let _ = backend.set_bus_listener(bus, app);
                 }
+                Command::SetStripListener { strip, app } => {
+                    let label = st.strips.get(strip).map(|s| s.display_name(strip)).unwrap_or_default();
+                    if let Some(s) = st.strips.get_mut(strip) {
+                        s.listener = app.clone();
+                    }
+                    st.push_log(format!(
+                        "{} {} → mic of {}",
+                        ts(),
+                        label,
+                        app.as_deref().unwrap_or("— none —")
+                    ));
+                    let _ = backend.set_strip_listener(strip, app);
+                }
                 Command::ToggleBusMonitor { bus, a_bus } => {
                     let mut on = false;
                     if let Some(b) = st.buses.get_mut(bus) {
@@ -558,6 +612,27 @@ fn run(
                             }
                         }
                         let _ = backend.set_bus_feed(from, to, on);
+                    }
+                }
+                Command::ToggleBusStripFeed { bus, strip } => {
+                    // Same direct-2-cycle guard as ToggleBusFeed, mirrored
+                    // for the strip→bus→strip case: refuse feeding a strip
+                    // that's already sending to this same bus.
+                    let strip_sends_here = st.strips.get(strip).and_then(|s| s.assign.get(bus)).copied().unwrap_or(false);
+                    let currently_on = st.buses.get(bus).and_then(|b| b.strip_feeds.get(strip)).copied().unwrap_or(false);
+                    if !currently_on && strip_sends_here {
+                        let bl = st.buses.get(bus).map(|b| b.label.clone()).unwrap_or_default();
+                        let sl = st.strips.get(strip).map(|s| s.display_name(strip)).unwrap_or_default();
+                        st.push_log(format!("{} refused: {} already sends to {} (would 2-cycle)", ts(), sl, bl));
+                    } else {
+                        let mut on = false;
+                        if let Some(b) = st.buses.get_mut(bus) {
+                            if let Some(f) = b.strip_feeds.get_mut(strip) {
+                                *f = !*f;
+                                on = *f;
+                            }
+                        }
+                        let _ = backend.set_bus_strip_feed(bus, strip, on);
                     }
                 }
                 Command::SetRecordingsDir { path } => {
@@ -612,6 +687,13 @@ fn run(
                             .filter(|(_, on)| **on)
                             .filter_map(|(gi, _)| all_labels.get(gi).cloned())
                             .collect(),
+                        strip_feeds: b
+                            .strip_feeds
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, on)| **on)
+                            .map(|(si, _)| si)
+                            .collect(),
                         kind: match b.kind { BusKind::HwOutput => "hw", BusKind::VirtualMic => "virtual" }.into(),
                         device: b.device.clone(),
                         volume: b.volume,
@@ -620,6 +702,7 @@ fn run(
                     config.strips = st.strips.iter().map(|s| crate::config::StripCfg {
                         name: s.name.clone(),
                         input: s.input.clone(),
+                        listener: s.listener.clone(),
                         volume: s.volume,
                         mute: s.mute,
                         assign: s.assign.iter().enumerate().filter(|(_, on)| **on)

@@ -99,8 +99,19 @@ impl<F: Fn(f32) -> Message> FaderCap<F> {
     }
 }
 
+/// `dragging` is the existing drag-in-progress flag; `last_click` feeds
+/// `mouse::Click::new()`'s consecutive-click detection (same 300ms +
+/// same-position idiom iced's own `text_input`/`text_editor` widgets use) so
+/// a double-click can be told apart from two separate single clicks — Iced
+/// 0.13's `canvas::Event` has no built-in double-click variant to consume.
+#[derive(Default)]
+struct FaderState {
+    dragging: bool,
+    last_click: Option<iced::advanced::mouse::click::Click>,
+}
+
 impl<F: Fn(f32) -> Message> canvas::Program<Message> for FaderCap<F> {
-    type State = bool; // dragging?
+    type State = FaderState;
 
     fn update(
         &self,
@@ -114,16 +125,25 @@ impl<F: Fn(f32) -> Message> canvas::Program<Message> for FaderCap<F> {
         let inside = cursor.is_over(bounds);
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(Button::Left)) if inside => {
-                *state = true;
                 let Some(pos) = cursor.position() else { return (event::Status::Ignored, None) };
+                let click = iced::advanced::mouse::click::Click::new(pos, Button::Left, state.last_click);
+                state.last_click = Some(click);
+                if matches!(click.kind(), iced::advanced::mouse::click::Kind::Double) {
+                    // Double-click: snap back to unity, same as right-click,
+                    // just a more discoverable gesture for some users. Don't
+                    // start a drag on top of it.
+                    state.dragging = false;
+                    return (event::Status::Captured, Some(self.emit(self.unity)));
+                }
+                state.dragging = true;
                 (event::Status::Captured, Some(self.emit(self.value_at(bounds, pos.y))))
             }
-            Event::Mouse(mouse::Event::CursorMoved { .. }) if *state => {
+            Event::Mouse(mouse::Event::CursorMoved { .. }) if state.dragging => {
                 let Some(pos) = cursor.position() else { return (event::Status::Ignored, None) };
                 (event::Status::Captured, Some(self.emit(self.value_at(bounds, pos.y))))
             }
             Event::Mouse(mouse::Event::ButtonReleased(Button::Left)) => {
-                *state = false;
+                state.dragging = false;
                 (event::Status::Ignored, None)
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if inside => {
@@ -404,7 +424,7 @@ fn dropdown<'a>(placeholder: &'a str, options: Vec<Opt>, selected: Option<Opt>, 
         .into()
 }
 
-pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState, width: f32, renaming: Option<&'a str>) -> Element<'a, Message> {
+pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState, width: f32, renaming: Option<&'a str>, active: bool) -> Element<'a, Message> {
     let accent = theme::ACCENT;
     let live_dot = text(if strip.input_live { "●" } else { "○" }).size(8).color(if strip.input_live { accent } else { theme::TEXT_DIM });
     let head = rename_head(strip.display_name(idx), renaming, RenameTarget::Strip(idx), 11, accent, live_dot.into());
@@ -414,6 +434,25 @@ pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState, width
         let input = if o.key == NONE_KEY { None } else { Some(o.key) };
         Message::Send(Command::SetStripInput { strip: idx, input })
     });
+    // A strip can also SEND to an app's microphone, same as a B-bus — full
+    // strip/bus symmetry, so audio can be routed app-to-app (e.g. an app fed
+    // by one strip, sent straight into another app's mic) not just app-to-
+    // hardware, the same way a hardware mixer routes across multiple devices.
+    let cap_opts: Vec<Opt> = state.capture_apps.iter().map(|a| Opt { key: a.key.clone(), label: a.label.clone() }).collect();
+    let listener_sel = strip.listener.as_ref().and_then(|k| cap_opts.iter().find(|o| &o.key == k).cloned());
+    let listener_dd = dropdown("◇ SEND TO APP", clearable_opts(cap_opts), listener_sel, move |o: Opt| {
+        let app = if o.key == NONE_KEY { None } else { Some(o.key) };
+        Message::Send(Command::SetStripListener { strip: idx, app })
+    });
+    let listening = if strip.listeners.is_empty() { text("no app assigned").size(9).color(theme::TEXT_DIM) } else { text(format!("◂ {} listening", elide(&strip.listeners[0], 12))).size(9).color(accent) };
+    // If the same app is both this strip's input AND its listener, sending
+    // the strip back to that app would let it hear itself — flag it instead
+    // of leaving a silent footgun (this is the strip-level version of the
+    // exact bug class the bus meter-tap fix addressed for buses).
+    let echo_warn: Element<Message> = match (&strip.input, &strip.listener) {
+        (Some(i), Some(l)) if i == l => text("⚠ same app as input — would echo").size(9).color(theme::MIC_AMBER).into(),
+        _ => Space::with_height(0).into(),
+    };
     let meter = Canvas::new(Meter { level: strip.level, accent }).width(Length::Fixed(30.0)).height(Length::Fixed(FADER_H));
     let fad = fader(strip.volume, accent, mixer_core::model::UNITY_POS, move |v| Message::Send(Command::SetStripVolume { strip: idx, volume: v }));
     let fader_row = row![meter, Space::with_width(4), fad, Space::with_width(8), text(fmt_db(strip.volume)).size(11).color(theme::TEXT)].align_y(Alignment::Center);
@@ -429,12 +468,12 @@ pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState, width
     let knobs = row![knob("GATE", dsp.gate, dsp.gate_on, theme::ACCENT, idx, dsp, true), Space::with_width(6), knob("COMP", dsp.comp, dsp.comp_on, theme::VIOLET, idx, dsp, false)];
     let mute = wide_button("MUTE", strip.mute, theme::REC_RED, Message::Send(Command::SetStripMute { strip: idx, mute: !strip.mute }));
     let rec = rec_button(strip.recording, RecTarget::Strip(idx));
-    let body = column![head, Space::with_height(5), input_dd, Space::with_height(8), fader_row, Space::with_height(8), column![a_row, b_row].spacing(3), Space::with_height(8), knobs, Space::with_height(8), row![mute, Space::with_width(4), rec].spacing(0)]
+    let body = column![head, Space::with_height(5), input_dd, Space::with_height(4), listener_dd, Space::with_height(3), listening, echo_warn, Space::with_height(6), fader_row, Space::with_height(8), column![a_row, b_row].spacing(3), Space::with_height(8), knobs, Space::with_height(8), row![mute, Space::with_width(4), rec].spacing(0)]
         .spacing(0).width(Length::Fixed(width));
-    container(body).padding(10).width(Length::Fixed(width + 20.0)).style(theme::card_accent(if strip.input_live { accent } else { theme::EDGE_SOFT })).into()
+    container(body).padding(10).width(Length::Fixed(width + 20.0)).style(theme::card_accent(if strip.input_live { accent } else { theme::EDGE_SOFT }, active)).into()
 }
 
-pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState, width: f32, renaming: Option<&'a str>) -> Element<'a, Message> {
+pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState, width: f32, renaming: Option<&'a str>, active: bool) -> Element<'a, Message> {
     let accent = theme::VIOLET;
     let name = if bus.name.is_empty() { bus.label.clone() } else { bus.name.clone() };
     let mic_tag = text("MIC").size(8).color(theme::TEXT_DIM);
@@ -501,7 +540,7 @@ pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState, width: f32,
     let rec = rec_button(bus.recording, RecTarget::Bus(idx));
     let body = column![head, Space::with_height(5), input_dd, Space::with_height(4), app_dd, Space::with_height(3), listening, dup_note, Space::with_height(6), fader_row, Space::with_height(8), text("MONITOR ON").size(8).color(theme::TEXT_DIM), Space::with_height(2), mon, Space::with_height(6), text("FEED →").size(8).color(theme::TEXT_DIM), Space::with_height(2), feed, Space::with_height(8), row![mute, Space::with_width(4), rec].spacing(0)]
         .spacing(0).width(Length::Fixed(width));
-    container(body).padding(10).width(Length::Fixed(width + 20.0)).style(theme::card_accent(accent)).into()
+    container(body).padding(10).width(Length::Fixed(width + 20.0)).style(theme::card_accent(accent, active)).into()
 }
 
 pub fn hw_out_slot<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState) -> Element<'a, Message> {
@@ -514,19 +553,9 @@ pub fn hw_out_slot<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState) -> Eleme
     let mute = button(text("M").size(10).color(if bus.mute { theme::BG_DEEP } else { theme::TEXT_DIM }))
         .style(move |_t, _s| button::Style { background: Some(iced::Background::Color(if bus.mute { theme::REC_RED } else { theme::PANEL_HI })), border: Border { color: theme::EDGE, width: 1.0, radius: 5.0.into() }, text_color: theme::TEXT_DIM, ..Default::default() })
         .padding([4, 8]).on_press(Message::Send(Command::SetBusMute { bus: idx, mute: !bus.mute }));
-    let top = row![text(&bus.label).size(14).color(theme::ACCENT), Space::with_width(8), dd, Space::with_width(6), mute].align_y(Alignment::Center);
-    // Direct input + meter, same feature as bus_card's — the hardware-out
-    // bus's meter reflects ONLY this assigned source (pre-fader), not the
-    // real mix reaching the speakers. Silent unless you assign one here.
-    let in_opts: Vec<Opt> = state.inputs.iter().map(|i| Opt { key: i.key.clone(), label: i.label.clone() }).collect();
-    let in_sel = bus.input.as_ref().and_then(|k| in_opts.iter().find(|o| &o.key == k).cloned());
-    let input_dd = dropdown("◆ INPUT (drives meter)", clearable_opts(in_opts), in_sel, move |o: Opt| {
-        let input = if o.key == NONE_KEY { None } else { Some(o.key) };
-        Message::Send(Command::SetBusInput { bus: idx, input })
-    });
-    let meter = Canvas::new(Meter { level: bus.level, accent: theme::ACCENT }).width(Length::Fixed(24.0)).height(Length::Fixed(36.0));
-    let bottom = row![meter, Space::with_width(6), input_dd].align_y(Alignment::Center);
-    container(column![top, Space::with_height(4), bottom].spacing(0))
+    // A-buses are output-only (they exist to send the mix to a speaker/
+    // headset) — no direct-input assignment or meter here, unlike B-buses.
+    container(row![text(&bus.label).size(14).color(theme::ACCENT), Space::with_width(8), dd, Space::with_width(6), mute].align_y(Alignment::Center))
         .padding(8).width(Length::Fixed(340.0)).style(theme::card).into()
 }
 
@@ -745,6 +774,22 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
         .into(),
     );
 
+    let reset_btn = button(text("⟲ RESET AUDIO TO STOCK PIPEWIRE").size(10).color(theme::BG_DEEP).center().width(Length::Fill))
+        .style(|_t, _s| button::Style { background: Some(iced::Background::Color(theme::MIC_AMBER)), border: Border { color: theme::MIC_AMBER, width: 1.0, radius: tokens::radius::SM.into() }, text_color: theme::BG_DEEP, ..Default::default() })
+        .padding([8, 0])
+        .on_press(Message::ResetAudio);
+    let recovery = card(
+        column![
+            section("RECOVERY"),
+            Space::with_height(8),
+            container(reset_btn).width(Length::Fixed(320.0)),
+            Space::with_height(6),
+            text("Restarts PipeWire, PipeWire-Pulse and WirePlumber back to a clean, stock state — the fix if audio ever gets stuck (most often after a DSP module misbehaves). Restart FerroMix itself afterward — its connection to the old PipeWire session won't survive the restart.").size(9).color(theme::TEXT_DIM),
+        ]
+        .spacing(0)
+        .into(),
+    );
+
     let about = card(
         column![
             section("ABOUT"),
@@ -768,6 +813,8 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
             Space::with_height(12),
             latency,
             Space::with_height(12),
+            recovery,
+            Space::with_height(12),
             about,
         ]
         .spacing(0)
@@ -785,11 +832,20 @@ pub fn log_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
     for line in state.log.iter().rev() {
         lines = lines.push(text(line).size(10).color(theme::TEXT_DIM).font(iced::Font::MONOSPACE));
     }
-    let head = column![
-        text("ACTIVITY LOG").size(14).color(theme::TEXT),
-        text("Routing changes, feedback blocks, saves — newest first.").size(9).color(theme::TEXT_DIM),
+    let copy_btn = button(text("⧉ COPY LOG").size(10).color(theme::TEXT_DIM))
+        .style(|_t, _s| button::Style { background: Some(iced::Background::Color(theme::PANEL_HI)), border: Border { color: theme::EDGE, width: 1.0, radius: 6.0.into() }, text_color: theme::TEXT_DIM, ..Default::default() })
+        .padding([6, 12])
+        .on_press(Message::CopyLog);
+    let head = row![
+        column![
+            text("ACTIVITY LOG").size(14).color(theme::TEXT),
+            text("Routing changes, feedback blocks, saves — newest first.").size(9).color(theme::TEXT_DIM),
+        ]
+        .spacing(4),
+        Space::with_width(Length::Fill),
+        copy_btn,
     ]
-    .spacing(4);
+    .align_y(Alignment::Center);
 
     scrollable(
         column![head, Space::with_height(16), container(lines).padding(12).width(Length::Fill).style(theme::card)]

@@ -51,6 +51,9 @@ enum Slot {
     Monitor(usize, usize),
     /// bus `from` monitor -> bus `to` input (bus-to-bus routing)
     Feed(usize, usize),
+    /// bus monitor -> strip device (bus-to-strip routing, the reverse of
+    /// `Send`) — lets a bus like B1 feed back into one or more strips.
+    BusToStrip(usize, usize),
     /// strip device monitor -> bus
     Send(usize, usize),
     /// bus monitor -> hardware sink
@@ -62,6 +65,11 @@ enum Slot {
     /// let it fall back to grabbing the raw default source. Drawing the link
     /// directly sidesteps WirePlumber entirely.
     BusListener(usize, NodeId),
+    /// Same as `BusListener`, for a strip acting as an app's mic feed —
+    /// drawn manually for the same reason (belt-and-suspenders: works
+    /// whether or not the strip's autoconnect setting would have let
+    /// WirePlumber route it via metadata alone).
+    StripListener(usize, NodeId),
     /// source -> strip's DSP filter-chain input (used instead of `StripIn`
     /// once a strip has a loaded gate/compressor module).
     DspIn(usize),
@@ -119,11 +127,16 @@ struct WorkerState {
     feeds: HashSet<(usize, usize)>,
     /// bus -> app key whose MICROPHONE we point at it.
     bus_listener: HashMap<usize, String>,
-    /// capture node -> bus name we already pointed it at.
+    /// Same as `bus_listener`, for a strip acting as an app's mic feed.
+    strip_listener: HashMap<usize, String>,
+    /// capture node -> bus/strip name we already pointed it at.
     capture_targets: HashMap<NodeId, String>,
     /// (bus idx, capture node) -> unit, tracking B-bus→app-mic links we drew
     /// ourselves so we can tear them down when the assignment changes.
     listener_links: HashMap<(usize, NodeId), ()>,
+    /// Same as `listener_links`, for `strip_listener`.
+    strip_listener_links: HashMap<(usize, NodeId), ()>,
+    last_strip_listeners: Vec<(usize, Vec<String>)>,
     last_capture_apps: Vec<SourceInfo>,
     last_sources: Vec<SourceInfo>,
     last_devices: Vec<Device>,
@@ -673,16 +686,24 @@ fn stray_sources(graph: &Graph, in_node: NodeId, keep: &[NodeId]) -> Vec<NodeId>
     v
 }
 
-/// Point the assigned app's microphone at each B bus, using the same
-/// `target.object` metadata trick we use for playback. This is what lets you
-/// set Discord's mic to B1 from inside FerroMix instead of digging through
-/// Discord's own settings.
-fn apply_bus_listeners(ctx: &Ctx) {
-    // Draw B-bus -> app-capture links ourselves. WirePlumber won't route into a
-    // node marked node.autoconnect=false, so target.object silently failed and
-    // the app's mic fell back to the default source (the Spotify+mic bleed).
-    // Collect the desired (bus_node, capture_node) pairs.
-    let desired: Vec<(usize, NodeId, NodeId)> = {
+/// Point each assigned app's microphone at whichever B-bus AND/OR strip it's
+/// been given to, using the same `target.object` metadata trick we use for
+/// playback. This is what lets you set Discord's mic to B1 (or to a strip)
+/// from inside FerroMix instead of digging through Discord's own settings.
+///
+/// Buses and strips are handled together, sharing one stray-redirect pass,
+/// because an app can legitimately listen to a bus AND a strip at once (same
+/// reasoning as multiple buses at once) — computing the "what's legitimately
+/// feeding this capture node" set separately per bus/strip would make each
+/// pass treat the OTHER's link as stray and fight it, the exact
+/// self-fighting bug class `stray_sources`'s own doc comment warns about.
+fn apply_listeners(ctx: &Ctx) {
+    // Draw bus/strip -> app-capture links ourselves. WirePlumber won't route
+    // into a node marked node.autoconnect=false, so target.object silently
+    // failed and the app's mic fell back to the default source (the
+    // Spotify+mic bleed) — and we draw strip links the same way for
+    // consistency/reliability even though strips don't disable autoconnect.
+    let desired_bus: Vec<(usize, NodeId, NodeId)> = {
         let st = ctx.st.borrow();
         let mut v = Vec::new();
         for (bus, key) in st.bus_listener.iter() {
@@ -697,23 +718,50 @@ fn apply_bus_listeners(ctx: &Ctx) {
         }
         v
     };
+    let desired_strip: Vec<(usize, NodeId, NodeId)> = {
+        let st = ctx.st.borrow();
+        let mut v = Vec::new();
+        for (strip, key) in st.strip_listener.iter() {
+            // Same reasoning as the bus case: a muted strip sends nothing.
+            if st.desired.strip_mute.get(strip).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(&(strip_node, _)) = st.strip_nodes.get(strip) else { continue };
+            for cap in resolve_capture(&st.graph, key) {
+                v.push((*strip, strip_node, cap));
+            }
+        }
+        v
+    };
 
     // Remove any stale listener links whose app is no longer assigned.
-    let stale: Vec<(usize, NodeId)> = {
+    let stale_bus: Vec<(usize, NodeId)> = {
         let st = ctx.st.borrow();
         st.listener_links
             .keys()
             .copied()
-            .filter(|(bus, cap)| !desired.iter().any(|(b, _, c)| b == bus && c == cap))
+            .filter(|(bus, cap)| !desired_bus.iter().any(|(b, _, c)| b == bus && c == cap))
             .collect()
     };
-    for (bus, cap) in stale {
+    for (bus, cap) in stale_bus {
         remove_slot_links(ctx, &Slot::BusListener(bus, cap));
         ctx.st.borrow_mut().listener_links.remove(&(bus, cap));
     }
+    let stale_strip: Vec<(usize, NodeId)> = {
+        let st = ctx.st.borrow();
+        st.strip_listener_links
+            .keys()
+            .copied()
+            .filter(|(s, cap)| !desired_strip.iter().any(|(sx, _, c)| sx == s && c == cap))
+            .collect()
+    };
+    for (strip, cap) in stale_strip {
+        remove_slot_links(ctx, &Slot::StripListener(strip, cap));
+        ctx.st.borrow_mut().strip_listener_links.remove(&(strip, cap));
+    }
 
     // Ensure the wanted links exist.
-    for &(bus, bus_node, cap) in &desired {
+    for &(bus, bus_node, cap) in &desired_bus {
         let already = ctx.st.borrow().listener_links.contains_key(&(bus, cap));
         if !already {
             let mut st = ctx.st.borrow_mut();
@@ -722,19 +770,27 @@ fn apply_bus_listeners(ctx: &Ctx) {
             log::info!("MIC LINK bus.{bus} -> {}", nname(&st, cap));
         }
     }
+    for &(strip, strip_node, cap) in &desired_strip {
+        let already = ctx.st.borrow().strip_listener_links.contains_key(&(strip, cap));
+        if !already {
+            let mut st = ctx.st.borrow_mut();
+            ensure_links(&ctx.core, &mut st, Slot::StripListener(strip, cap), strip_node, cap);
+            st.strip_listener_links.insert((strip, cap), ());
+            log::info!("MIC LINK strip.{strip} -> {}", nname(&st, cap));
+        }
+    }
 
     // Redirect: cut anything feeding an app's capture that ISN'T one of its
-    // legitimately-assigned FerroMix buses — typically the app's real default
-    // microphone, auto-connected by WirePlumber before we could react (see
-    // `stray_sources`'s doc). Grouped by capture node first, keeping EVERY
-    // bus assigned to it (an app can legitimately listen to more than one
-    // B-bus at once — see `stray_sources`'s doc for why a single-`keep`
-    // version of this fought itself). Runs every pass, not gated behind
+    // legitimately-assigned FerroMix buses/strips — typically the app's real
+    // default microphone, auto-connected by WirePlumber before we could
+    // react (see `stray_sources`'s doc). Grouped by capture node first,
+    // keeping EVERY bus/strip assigned to it (an app can legitimately listen
+    // to more than one at once). Runs every pass, not gated behind
     // `already`, so a stray link that reappears later still gets caught —
-    // cheap no-op once the capture is already exclusive to FerroMix buses.
+    // cheap no-op once the capture is already exclusive to FerroMix.
     let mut legit_by_cap: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-    for &(_, bus_node, cap) in &desired {
-        legit_by_cap.entry(cap).or_default().push(bus_node);
+    for &(_, node, cap) in desired_bus.iter().chain(desired_strip.iter()) {
+        legit_by_cap.entry(cap).or_default().push(node);
     }
     for (cap, keep) in legit_by_cap {
         let stray = {
@@ -811,10 +867,34 @@ fn emit_listeners(ctx: &Ctx) {
         out.sort();
         out
     };
+    let strip_listeners: Vec<(usize, Vec<String>)> = {
+        let st = ctx.st.borrow();
+        let mut out = Vec::new();
+        for (idx, (node, _)) in st.strip_nodes.iter() {
+            let mut who: Vec<String> = st
+                .graph
+                .links
+                .values()
+                .filter(|l| l.out_node == *node)
+                .filter_map(|l| st.graph.nodes.get(&l.in_node))
+                .filter(|n| n.kind() == NodeKind::AppCapture)
+                .map(|n| n.label())
+                .collect();
+            who.sort();
+            who.dedup();
+            out.push((*idx, who));
+        }
+        out.sort();
+        out
+    };
     let mut st = ctx.st.borrow_mut();
     if listeners != st.last_listeners {
         st.last_listeners = listeners.clone();
         let _ = ctx.ev_tx.send(BackendEvent::BusListeners(listeners));
+    }
+    if strip_listeners != st.last_strip_listeners {
+        st.last_strip_listeners = strip_listeners.clone();
+        let _ = ctx.ev_tx.send(BackendEvent::StripListeners(strip_listeners));
     }
 }
 
@@ -973,7 +1053,7 @@ fn listens(
 /// command reconverges listener links too, matching the "declarative
 /// reconciler" architecture (see docs/ARCHITECTURE.md).
 fn reconcile_all(ctx: &Ctx) {
-    apply_bus_listeners(ctx);
+    apply_listeners(ctx);
     reconcile(ctx);
 }
 
@@ -1143,15 +1223,23 @@ fn reconcile(ctx: &Ctx) {
             ensure_links(&ctx.core, st, Slot::Send(sidx, bidx), strip_node, bus_node);
         }
 
-        // 3b. Bus monitoring: send a virtual mic into a hardware out so you can
-        //     hear exactly what you're sending to the far end.
+        // 3b. Bus monitoring: hear what the app assigned to a B-bus (its
+        //     `listener`) is actually SENDING you — that app's own playback,
+        //     e.g. Discord's incoming voice — NOT the B-bus's own mix (which
+        //     is what you're sending THEM, typically including your own
+        //     mic). Those are two independent directions sharing the same
+        //     bus "stack" for convenience: mic → B2 → Discord's capture (the
+        //     `assign`/listener machinery, unchanged) sends your voice out;
+        //     this step pipes Discord's own voice back to your speakers,
+        //     with no shared audio between the two paths, so you never hear
+        //     yourself. No listener assigned = nothing to monitor.
         let mons: Vec<(usize, usize)> = st.monitors.iter().copied().collect();
         for (b, a) in mons {
-            let (Some(&(src, _)), Some(&(dst, _))) = (st.bus_nodes.get(&b), st.bus_nodes.get(&a))
-            else {
-                continue;
-            };
-            ensure_links(&ctx.core, st, Slot::Monitor(b, a), src, dst);
+            let Some(&(dst, _)) = st.bus_nodes.get(&a) else { continue };
+            let Some(key) = st.bus_listener.get(&b).cloned() else { continue };
+            for src in resolve_source(&st.graph, &key) {
+                ensure_links(&ctx.core, st, Slot::Monitor(b, a), src, dst);
+            }
         }
 
         // 3c. Bus-to-bus feeds: a bus's output additionally routed into
@@ -1334,8 +1422,11 @@ fn remove_slot_links(ctx: &Ctx, slot: &Slot) {
             }
         }
         Slot::Monitor(b, a) => {
-            match (st.bus_nodes.get(b).map(|(id, _)| *id), st.bus_nodes.get(a).map(|(id, _)| *id)) {
-                (Some(s), Some(d)) => Some((vec![s], d)),
+            // Mirrors the new source resolution in reconcile()'s step 3b:
+            // the link's real source is the bus's listener app's playback,
+            // not the bus's own node — see that step's comment for why.
+            match (st.bus_listener.get(b).cloned(), st.bus_nodes.get(a).map(|(id, _)| *id)) {
+                (Some(k), Some(d)) => Some((resolve_source(&st.graph, &k), d)),
                 _ => None,
             }
         }
@@ -1347,6 +1438,9 @@ fn remove_slot_links(ctx: &Ctx, slot: &Slot) {
         }
         Slot::BusListener(bus, cap) => {
             st.bus_nodes.get(bus).map(|(id, _)| *id).map(|bus_node| (vec![bus_node], *cap))
+        }
+        Slot::StripListener(strip, cap) => {
+            st.strip_nodes.get(strip).map(|(id, _)| *id).map(|strip_node| (vec![strip_node], *cap))
         }
         Slot::BusDev(_) => None,
         Slot::DspIn(idx) => {
@@ -1638,6 +1732,7 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             }
         }
         PwCmd::SetBusListener { bus, app_key } => {
+            let old_key = ctx.st.borrow().bus_listener.get(&bus).cloned();
             {
                 let mut st = ctx.st.borrow_mut();
                 // Release the previous app so WirePlumber can place it normally.
@@ -1655,8 +1750,51 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                     st.bus_listener.insert(bus, k);
                 }
             }
-            apply_bus_listeners(ctx);
+            // The listener changing invalidates any active MONITOR ON links
+            // for this bus (step 3b's source is the bus's listener's own
+            // playback, not the bus's own node) — tear down links from the
+            // OLD listener's playback explicitly, since `ensure_links` only
+            // adds missing pairs and wouldn't otherwise notice the desired
+            // source itself changed out from under an unchanged Slot key.
+            if let Some(old) = old_key {
+                let affected: Vec<usize> =
+                    ctx.st.borrow().monitors.iter().filter(|(b, _)| *b == bus).map(|(_, a)| *a).collect();
+                for a in affected {
+                    let mut st = ctx.st.borrow_mut();
+                    let dst = st.bus_nodes.get(&a).map(|(id, _)| *id);
+                    if let Some(dst) = dst {
+                        let srcs = resolve_source(&st.graph, &old);
+                        for src in srcs {
+                            remove_links_between(ctx, &mut st, src, dst);
+                        }
+                    }
+                }
+            }
+            apply_listeners(ctx);
             emit_listeners(ctx);
+            reconcile_all(ctx);
+        }
+        PwCmd::SetStripListener { idx, app_key } => {
+            {
+                let mut st = ctx.st.borrow_mut();
+                // Release the previous app so WirePlumber can place it normally.
+                if let Some(old) = st.strip_listener.remove(&idx) {
+                    let nodes = resolve_capture(&st.graph, &old);
+                    for n in nodes {
+                        if st.capture_targets.remove(&n).is_some() {
+                            if let Some(md) = st.metadata.as_ref() {
+                                md.set_property(n, "target.object", None, None);
+                            }
+                        }
+                    }
+                }
+                if let Some(k) = app_key {
+                    st.strip_listener.insert(idx, k);
+                }
+            }
+            apply_listeners(ctx);
+            emit_listeners(ctx);
+            reconcile_all(ctx);
         }
         PwCmd::StartRecord { target, path } => {
             // Strips and A-buses are sinks (record their monitor); B-buses are

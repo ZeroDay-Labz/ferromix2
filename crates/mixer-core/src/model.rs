@@ -122,6 +122,16 @@ pub struct Strip {
     /// Per-strip DSP. Off by default; each strip owns its own gate + compressor.
     #[serde(default)]
     pub dsp: StripDsp,
+    /// The app we've *assigned* to listen to this strip — same mechanism as
+    /// `Bus.listener`, so any strip can also act as a mic feed for an app,
+    /// not just B-buses. Lets you route app-to-app (e.g. a strip fed by one
+    /// app, sent straight into another app's mic) the same way a hardware
+    /// mixer routes across multiple devices.
+    #[serde(default)]
+    pub listener: Option<String>,
+    /// Apps currently capturing from this strip — who is actually listening.
+    #[serde(default)]
+    pub listeners: Vec<String>,
 }
 
 /// Per-strip signal processing. A downward noise gate followed by a soft-knee
@@ -183,6 +193,8 @@ impl Strip {
             assign: vec![false; n_buses],
             recording: false,
             dsp: StripDsp::default(),
+            listener: None,
+            listeners: Vec::new(),
         }
     }
 }
@@ -204,6 +216,15 @@ pub struct Bus {
     /// like `monitor`. Only meaningful between VirtualMic buses.
     #[serde(default)]
     pub feeds: Vec<bool>,
+    /// strip_feeds[strip_idx] — this bus's output is additionally routed
+    /// into that strip's device, alongside anything else feeding the strip.
+    /// Global strip index. Lets a bus (e.g. B1 as a shared "everything"
+    /// channel) feed back into one or more strips, the reverse direction of
+    /// `Strip.assign`. Refused (no-op) if that strip already sends to this
+    /// bus — direct strip→bus→strip cycles are guarded against the same way
+    /// bus→bus 2-cycles are (see `feeds`), longer chains are not, by design.
+    #[serde(default)]
+    pub strip_feeds: Vec<bool>,
     pub kind: BusKind,
     pub device: Option<String>,
     /// A directly-assigned source (app or hw device) this bus's METER should

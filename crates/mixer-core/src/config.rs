@@ -15,6 +15,10 @@ pub struct BusCfg {
     /// Other buses (by label) this bus additionally feeds into.
     #[serde(default)]
     pub feeds: Vec<String>,
+    /// Strips (by index — strips have no stable label, and the strip count
+    /// is fixed, so raw index is stable here) this bus additionally feeds.
+    #[serde(default)]
+    pub strip_feeds: Vec<usize>,
     /// A directly-assigned source (app/hw key) feeding this bus, same meaning
     /// as `StripCfg.input`.
     #[serde(default)]
@@ -40,6 +44,10 @@ pub struct StripCfg {
     /// if absent.
     #[serde(default)]
     pub input: Option<String>,
+    /// App whose microphone we point at this strip, same meaning as
+    /// `BusCfg.listener`.
+    #[serde(default)]
+    pub listener: Option<String>,
     #[serde(default = "default_volume")]
     pub volume: f32,
     #[serde(default)]
@@ -99,12 +107,12 @@ impl Default for Config {
             strip_count: 5,
             ui_scale: 0.0, // auto
             buses: vec![
-                BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), input: None, listener: None, label: "A1".into(), kind: "hw".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
-                BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), input: None, listener: None, label: "A2".into(), kind: "hw".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
-                BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), input: None, listener: None, label: "A3".into(), kind: "hw".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
-                BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), input: None, listener: None, label: "B1".into(), kind: "virtual".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
-                BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), input: None, listener: None, label: "B2".into(), kind: "virtual".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
-                BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), input: None, listener: None, label: "B3".into(), kind: "virtual".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
+                BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), strip_feeds: Vec::new(), input: None, listener: None, label: "A1".into(), kind: "hw".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
+                BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), strip_feeds: Vec::new(), input: None, listener: None, label: "A2".into(), kind: "hw".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
+                BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), strip_feeds: Vec::new(), input: None, listener: None, label: "A3".into(), kind: "hw".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
+                BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), strip_feeds: Vec::new(), input: None, listener: None, label: "B1".into(), kind: "virtual".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
+                BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), strip_feeds: Vec::new(), input: None, listener: None, label: "B2".into(), kind: "virtual".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
+                BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), strip_feeds: Vec::new(), input: None, listener: None, label: "B3".into(), kind: "virtual".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
             ],
             // A sensible starting patch, mostly pre-filled so it's not empty.
             // Each strip starts wired to its own virtual input and to A1, so
@@ -112,7 +120,7 @@ impl Default for Config {
             // Strips start as bare devices routed to A1: point an app's output
             // at "FerroMix Input N" and you hear it immediately.
             strips: (0..5)
-                .map(|_| StripCfg { name: String::new(), input: None, volume: crate::model::UNITY_POS, mute: false, assign: vec!["A1".into()] })
+                .map(|_| StripCfg { name: String::new(), input: None, listener: None, volume: crate::model::UNITY_POS, mute: false, assign: vec!["A1".into()] })
                 .collect(),
         }
     }
@@ -166,6 +174,7 @@ impl Config {
                     name: String::new(),
                     monitor: Vec::new(),
                     feeds: Vec::new(),
+                    strip_feeds: Vec::new(),
                     input: None,
                     kind: kind.into(),
                     device: None,
@@ -183,6 +192,7 @@ impl Config {
             self.strips.push(StripCfg {
                 name: String::new(),
                 input: None,
+                listener: None,
                 volume: crate::model::UNITY_POS,
                 mute: false,
                 assign: vec!["A1".into()],

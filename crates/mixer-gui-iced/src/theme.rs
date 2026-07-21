@@ -70,17 +70,36 @@ pub fn card(_t: &iced::Theme) -> iced::widget::container::Style {
     }
 }
 
-/// A card with an accent-tinted edge (live strip / B bus).
-pub fn card_accent(accent: Color) -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
-    move |_t| iced::widget::container::Style {
-        background: Some(Background::Color(CARD)),
-        border: Border { color: with_alpha(accent, 0.45), width: 1.0, radius: 8.0.into() },
-        shadow: Shadow {
-            color: Color { a: 0.35, ..BG_DEEP },
-            offset: Vector::new(0.0, 3.0),
-            blur_radius: 12.0,
-        },
-        text_color: Some(TEXT),
+/// A card with an accent-tinted edge (live strip / B bus). `active` overrides
+/// the edge with a bright amber "phosphor" outline — the strip/bus you just
+/// touched (fader drag, dropdown, mute, any control), fading back to the
+/// normal accent edge a moment after you stop interacting with it. Just the
+/// outline, no glow/shadow bloom — that read as too much.
+pub fn card_accent(accent: Color, active: bool) -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
+    move |_t| {
+        if active {
+            iced::widget::container::Style {
+                background: Some(Background::Color(CARD)),
+                border: Border { color: MIC_AMBER, width: 2.0, radius: 8.0.into() },
+                shadow: Shadow {
+                    color: Color { a: 0.35, ..BG_DEEP },
+                    offset: Vector::new(0.0, 3.0),
+                    blur_radius: 12.0,
+                },
+                text_color: Some(TEXT),
+            }
+        } else {
+            iced::widget::container::Style {
+                background: Some(Background::Color(CARD)),
+                border: Border { color: with_alpha(accent, 0.45), width: 1.0, radius: 8.0.into() },
+                shadow: Shadow {
+                    color: Color { a: 0.35, ..BG_DEEP },
+                    offset: Vector::new(0.0, 3.0),
+                    blur_radius: 12.0,
+                },
+                text_color: Some(TEXT),
+            }
+        }
     }
 }
 

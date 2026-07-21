@@ -304,6 +304,9 @@ impl AudioBackend for MockBackend {
     fn set_bus_feed(&mut self, _from: usize, _to: usize, _on: bool) -> BackendResult {
         Ok(())
     }
+    fn set_bus_strip_feed(&mut self, _bus: usize, _strip: usize, _on: bool) -> BackendResult {
+        Ok(())
+    }
     fn set_bus_input(&mut self, idx: usize, source_key: Option<String>) -> BackendResult {
         let mut sh = self.shared.lock().unwrap();
         match source_key {
@@ -326,6 +329,9 @@ impl AudioBackend for MockBackend {
                 sh.bus_listener.remove(&bus_idx);
             }
         }
+        Ok(())
+    }
+    fn set_strip_listener(&mut self, _idx: usize, _app_key: Option<String>) -> BackendResult {
         Ok(())
     }
     fn start_record(&mut self, target: RecTarget, path: PathBuf) -> BackendResult {
