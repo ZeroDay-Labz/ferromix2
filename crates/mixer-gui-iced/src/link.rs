@@ -105,7 +105,9 @@ pub fn spawn() -> (Sender<ToLink>, Receiver<FromLink>) {
                     break; // reconnect
                 }
             }
-            std::thread::sleep(Duration::from_millis(33));
+            // Matches main.rs's subscription poll rate (~60Hz) — snappier
+            // meters than the old 33ms/~30Hz.
+            std::thread::sleep(Duration::from_millis(16));
         }
     });
 

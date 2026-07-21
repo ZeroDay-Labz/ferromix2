@@ -20,6 +20,9 @@ struct Shared {
     n_buses: usize,
     /// strip -> chosen source key
     strip_input: HashMap<usize, String>,
+    /// bus -> directly-assigned source key (mock doesn't drive signal from it)
+    #[allow(dead_code)]
+    bus_input: HashMap<usize, String>,
     strip_faders: HashMap<usize, (f32, bool)>,
     bus_faders: HashMap<usize, (f32, bool)>,
     /// (strip, bus) sends that are on.
@@ -295,18 +298,22 @@ impl AudioBackend for MockBackend {
         self.shared.lock().unwrap().guard = on;
         Ok(())
     }
-    fn set_default_output_strip(&mut self, idx: usize) -> BackendResult {
-        let _ = self.tx.send(BackendEvent::DefaultOutput(Some(idx)));
-        let _ = self
-            .tx
-            .send(BackendEvent::Log(format!("mock: system default output → Input {}", idx + 1)));
-        Ok(())
-    }
-    fn set_default_input_bus(&mut self, idx: usize) -> BackendResult {
-        let _ = self.tx.send(BackendEvent::DefaultInput(Some(idx)));
-        Ok(())
-    }
     fn set_bus_monitor(&mut self, _bus_idx: usize, _a_bus_idx: usize, _on: bool) -> BackendResult {
+        Ok(())
+    }
+    fn set_bus_feed(&mut self, _from: usize, _to: usize, _on: bool) -> BackendResult {
+        Ok(())
+    }
+    fn set_bus_input(&mut self, idx: usize, source_key: Option<String>) -> BackendResult {
+        let mut sh = self.shared.lock().unwrap();
+        match source_key {
+            Some(k) => {
+                sh.bus_input.insert(idx, k);
+            }
+            None => {
+                sh.bus_input.remove(&idx);
+            }
+        }
         Ok(())
     }
     fn set_bus_listener(&mut self, bus_idx: usize, app_key: Option<String>) -> BackendResult {

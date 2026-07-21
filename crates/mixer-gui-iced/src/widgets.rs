@@ -223,7 +223,19 @@ impl Dial {
 }
 
 impl canvas::Program<Message> for Dial {
-    type State = Option<f32>; // drag anchor: cursor-y at press
+    // (anchor_y_at_press, value_at_press) — BOTH fixed for the whole drag
+    // gesture, never re-slid. `self.value` only refreshes when a fresh
+    // MixerState arrives from the ~30Hz async daemon poll, which is stale for
+    // the duration of a fast drag; a version of this that re-anchored on
+    // every CursorMoved (and added the per-event delta to the still-stale
+    // `self.value`) made a real 100px drag collapse to whatever the last
+    // couple of mouse-move samples produced — the knob felt unresponsive to
+    // dragging even though every command it did send was well-formed and
+    // reached a verified-working backend. Snapshotting both values at press
+    // time and computing everything relative to that snapshot (never to
+    // `self.value` again mid-gesture) makes the result depend only on total
+    // cursor travel since press, immune to how stale `self.value` gets.
+    type State = Option<(f32, f32)>;
 
     fn update(&self, state: &mut Self::State, event: canvas::Event, bounds: Rectangle, cursor: iced::mouse::Cursor) -> (canvas::event::Status, Option<Message>) {
         use canvas::event::{self, Event};
@@ -231,15 +243,15 @@ impl canvas::Program<Message> for Dial {
         let inside = cursor.is_over(bounds);
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(Button::Left)) if inside => {
-                *state = cursor.position().map(|p| p.y);
+                *state = cursor.position().map(|p| (p.y, self.value));
                 (event::Status::Captured, None)
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                if let (Some(anchor), Some(pos)) = (*state, cursor.position()) {
-                    // Drag up = increase. 120px of travel = full range.
-                    let delta = (anchor - pos.y) / 120.0;
-                    *state = Some(pos.y);
-                    return (event::Status::Captured, Some(self.emit(self.value + delta)));
+                if let (Some((anchor_y, anchor_value)), Some(pos)) = (*state, cursor.position()) {
+                    // Drag up = increase. 120px of travel = full range,
+                    // measured from the press point, not the last event.
+                    let delta = (anchor_y - pos.y) / 120.0;
+                    return (event::Status::Captured, Some(self.emit(anchor_value + delta)));
                 }
                 (event::Status::Ignored, None)
             }
@@ -284,22 +296,28 @@ impl canvas::Program<Message> for Dial {
             Stroke::default().with_color(dim).with_width(5.0),
         );
 
-        if self.on {
-            let v = self.value.clamp(0.0, 1.0);
-            // Glow underlay.
-            f.stroke(
-                &Path::new(|p| { p.arc(canvas::path::Arc { center: c, radius: rad, start_angle: iced::Radians(start), end_angle: iced::Radians(start + sweep * v) }); }),
-                Stroke::default().with_color(theme::with_alpha(self.accent, 0.35)).with_width(9.0),
-            );
-            // Bright value arc.
-            f.stroke(
-                &Path::new(|p| { p.arc(canvas::path::Arc { center: c, radius: rad, start_angle: iced::Radians(start), end_angle: iced::Radians(start + sweep * v) }); }),
-                Stroke::default().with_color(self.accent).with_width(5.0),
-            );
-            // Pointer dot.
-            let ang = start + sweep * v;
-            f.fill(&Path::circle(Point::new(c.x + rad * ang.cos(), c.y + rad * ang.sin()), 3.5), theme::TEXT);
-        }
+        // Value arc always renders — dimmer when off — so a drag is visibly
+        // responding immediately, even before the GATE/COMP label is clicked
+        // on. Previously this only drew `if self.on`, which combined with the
+        // drag-accumulation bug (now fixed) made a drag look completely
+        // inert: nothing moved on screen until the user separately toggled
+        // the knob on, so a real drag gesture appeared to do nothing twice
+        // over.
+        let v = self.value.clamp(0.0, 1.0);
+        let (glow_a, bright_a) = if self.on { (0.35, 1.0) } else { (0.15, 0.35) };
+        // Glow underlay.
+        f.stroke(
+            &Path::new(|p| { p.arc(canvas::path::Arc { center: c, radius: rad, start_angle: iced::Radians(start), end_angle: iced::Radians(start + sweep * v) }); }),
+            Stroke::default().with_color(theme::with_alpha(self.accent, glow_a)).with_width(9.0),
+        );
+        // Value arc.
+        f.stroke(
+            &Path::new(|p| { p.arc(canvas::path::Arc { center: c, radius: rad, start_angle: iced::Radians(start), end_angle: iced::Radians(start + sweep * v) }); }),
+            Stroke::default().with_color(theme::with_alpha(self.accent, bright_a)).with_width(5.0),
+        );
+        // Pointer dot.
+        let ang = start + sweep * v;
+        f.fill(&Path::circle(Point::new(c.x + rad * ang.cos(), c.y + rad * ang.sin()), 3.5), theme::with_alpha(theme::TEXT, if self.on { 1.0 } else { 0.5 }));
 
         // Hub with a subtle bevel.
         f.fill(&Path::circle(c, rad * 0.5), theme::PANEL_HI);
@@ -308,15 +326,20 @@ impl canvas::Program<Message> for Dial {
     }
 }
 
-struct Meter { level: f32, accent: Color }
-impl<M> canvas::Program<M> for Meter {
-    type State = ();
-    fn draw(&self, _s: &(), r: &Renderer, _t: &Theme, b: Rectangle, _c: iced::mouse::Cursor) -> Vec<Geometry> {
-        let mut f = Frame::new(r, b.size());
-        f.fill(&Path::rounded_rectangle(Point::ORIGIN, b.size(), 3.0.into()), theme::SEG_OFF);
+/// Stereo VU meter: two independent segmented bars (L/R) side by side, each
+/// driven by its own channel's peak — a mono source lights both identically,
+/// a genuinely stereo one visibly doesn't. `level` is pre-fader/source-only
+/// for strips (see `sync_prefader_tap` in the daemon) — it reflects what the
+/// strip's assigned source is producing, not whatever's downstream of the
+/// fader or where the strip is routed to.
+struct Meter { level: mixer_core::model::Level, accent: Color }
+impl Meter {
+    /// Draw one channel's segmented bar into `x..x+w` of the frame.
+    fn draw_bar(f: &mut Frame, x: f32, w: f32, height: f32, level: f32, accent: Color) {
+        f.fill(&Path::rounded_rectangle(Point::new(x, 0.0), Size::new(w, height), 3.0.into()), theme::SEG_OFF);
         let segs = 20;
-        let lit = (self.level.clamp(0.0, 1.0) * segs as f32).round() as i32;
-        let sh = b.height / segs as f32;
+        let lit = (level.clamp(0.0, 1.0) * segs as f32).round() as i32;
+        let sh = height / segs as f32;
         // Topmost lit segment = the loudest one; give it a soft bloom (a wider,
         // dimmer underlay) so the peak reads at a glance instead of just being
         // "one more solid block".
@@ -326,17 +349,13 @@ impl<M> canvas::Program<M> for Meter {
                 let frac = (segs - 1 - i) as f32 / segs as f32;
                 let col = if frac > 0.85 { theme::METER_HI } else if frac > 0.6 { theme::METER_MID } else { theme::METER_LO };
                 let seg = Path::rounded_rectangle(
-                    Point::new(1.5, i as f32 * sh + 0.75),
-                    Size::new(b.width - 3.0, sh - 1.5),
+                    Point::new(x + 1.0, i as f32 * sh + 0.75),
+                    Size::new(w - 2.0, sh - 1.5),
                     1.5.into(),
                 );
                 if i as i32 == peak_i {
                     f.fill(
-                        &Path::rounded_rectangle(
-                            Point::new(0.0, i as f32 * sh - 1.0),
-                            Size::new(b.width, sh + 2.0),
-                            2.5.into(),
-                        ),
+                        &Path::rounded_rectangle(Point::new(x, i as f32 * sh - 1.0), Size::new(w, sh + 2.0), 2.5.into()),
                         theme::with_alpha(col, 0.35),
                     );
                 }
@@ -344,9 +363,19 @@ impl<M> canvas::Program<M> for Meter {
             }
         }
         f.stroke(
-            &Path::rounded_rectangle(Point::ORIGIN, b.size(), 3.0.into()),
-            Stroke::default().with_color(theme::with_alpha(self.accent, 0.4)).with_width(1.0),
+            &Path::rounded_rectangle(Point::new(x, 0.0), Size::new(w, height), 3.0.into()),
+            Stroke::default().with_color(theme::with_alpha(accent, 0.4)).with_width(1.0),
         );
+    }
+}
+impl<M> canvas::Program<M> for Meter {
+    type State = ();
+    fn draw(&self, _s: &(), r: &Renderer, _t: &Theme, b: Rectangle, _c: iced::mouse::Cursor) -> Vec<Geometry> {
+        let mut f = Frame::new(r, b.size());
+        let gap = 2.0;
+        let bar_w = (b.width - gap) / 2.0;
+        Self::draw_bar(&mut f, 0.0, bar_w, b.height, self.level.l, self.accent);
+        Self::draw_bar(&mut f, bar_w + gap, bar_w, b.height, self.level.r, self.accent);
         vec![f.into_geometry()]
     }
 }
@@ -354,6 +383,19 @@ impl<M> canvas::Program<M> for Meter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opt { pub key: String, pub label: String }
 impl std::fmt::Display for Opt { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.label) } }
+
+/// Sentinel key for the synthetic "clear" entry `clearable_opts` prepends.
+/// Not a real source/app key, so it can never collide with one.
+const NONE_KEY: &str = "\u{0}__ferromix_none__";
+
+/// Prepend a "— none / clear —" entry so a strip/bus that's already assigned
+/// can be unassigned again, not just reassigned to a different live source —
+/// `SetStripInput`/`SetBusListener` already accept `None` end-to-end, the
+/// dropdown just never offered a way to pick it once something was selected.
+fn clearable_opts(mut opts: Vec<Opt>) -> Vec<Opt> {
+    opts.insert(0, Opt { key: NONE_KEY.to_string(), label: "— none / clear —".to_string() });
+    opts
+}
 
 fn dropdown<'a>(placeholder: &'a str, options: Vec<Opt>, selected: Option<Opt>, on_select: impl Fn(Opt) -> Message + 'a) -> Element<'a, Message> {
     pick_list(options, selected, on_select)
@@ -368,8 +410,11 @@ pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState, width
     let head = rename_head(strip.display_name(idx), renaming, RenameTarget::Strip(idx), 11, accent, live_dot.into());
     let opts: Vec<Opt> = state.inputs.iter().map(|i| Opt { key: i.key.clone(), label: i.label.clone() }).collect();
     let sel = strip.input.as_ref().and_then(|k| opts.iter().find(|o| &o.key == k).cloned());
-    let input_dd = dropdown("— select source —", opts, sel, move |o: Opt| Message::Send(Command::SetStripInput { strip: idx, input: Some(o.key) }));
-    let meter = Canvas::new(Meter { level: strip.level.peak(), accent }).width(Length::Fixed(20.0)).height(Length::Fixed(FADER_H));
+    let input_dd = dropdown("— select source —", clearable_opts(opts), sel, move |o: Opt| {
+        let input = if o.key == NONE_KEY { None } else { Some(o.key) };
+        Message::Send(Command::SetStripInput { strip: idx, input })
+    });
+    let meter = Canvas::new(Meter { level: strip.level, accent }).width(Length::Fixed(30.0)).height(Length::Fixed(FADER_H));
     let fad = fader(strip.volume, accent, mixer_core::model::UNITY_POS, move |v| Message::Send(Command::SetStripVolume { strip: idx, volume: v }));
     let fader_row = row![meter, Space::with_width(4), fad, Space::with_width(8), text(fmt_db(strip.volume)).size(11).color(theme::TEXT)].align_y(Alignment::Center);
     let mut a_row = row![].spacing(3); let mut b_row = row![].spacing(3);
@@ -384,17 +429,7 @@ pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState, width
     let knobs = row![knob("GATE", dsp.gate, dsp.gate_on, theme::ACCENT, idx, dsp, true), Space::with_width(6), knob("COMP", dsp.comp, dsp.comp_on, theme::VIOLET, idx, dsp, false)];
     let mute = wide_button("MUTE", strip.mute, theme::REC_RED, Message::Send(Command::SetStripMute { strip: idx, mute: !strip.mute }));
     let rec = rec_button(strip.recording, RecTarget::Strip(idx));
-    // SET AS DEFAULT: make this strip the system default output, so any app on
-    // "default" (e.g. Spotify) flows into it automatically. This is how you get
-    // "all my desktop audio through one strip" without configuring each app.
-    let is_default = state.default_output == Some(idx);
-    let default_btn = wide_button(
-        if is_default { "★ SYSTEM DEFAULT" } else { "SET AS DEFAULT" },
-        is_default,
-        theme::MIC_AMBER,
-        Message::Send(Command::SetDefaultOutput { strip: idx }),
-    );
-    let body = column![head, Space::with_height(5), input_dd, Space::with_height(8), fader_row, Space::with_height(8), column![a_row, b_row].spacing(3), Space::with_height(8), knobs, Space::with_height(8), row![mute, Space::with_width(4), rec].spacing(0), Space::with_height(4), default_btn]
+    let body = column![head, Space::with_height(5), input_dd, Space::with_height(8), fader_row, Space::with_height(8), column![a_row, b_row].spacing(3), Space::with_height(8), knobs, Space::with_height(8), row![mute, Space::with_width(4), rec].spacing(0)]
         .spacing(0).width(Length::Fixed(width));
     container(body).padding(10).width(Length::Fixed(width + 20.0)).style(theme::card_accent(if strip.input_live { accent } else { theme::EDGE_SOFT })).into()
 }
@@ -404,11 +439,47 @@ pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState, width: f32,
     let name = if bus.name.is_empty() { bus.label.clone() } else { bus.name.clone() };
     let mic_tag = text("MIC").size(8).color(theme::TEXT_DIM);
     let head = rename_head(name, renaming, RenameTarget::Bus(idx), 14, accent, mic_tag.into());
+    // Direct input: this bus's own source, same freedom a strip's input has.
+    // The bus's meter reflects ONLY this — pre-fader, source-only — never
+    // the mixed content routed in via the strip send matrix or bus feeds.
+    let in_opts: Vec<Opt> = state.inputs.iter().map(|i| Opt { key: i.key.clone(), label: i.label.clone() }).collect();
+    let in_sel = bus.input.as_ref().and_then(|k| in_opts.iter().find(|o| &o.key == k).cloned());
+    let input_dd = dropdown("◆ INPUT (drives meter)", clearable_opts(in_opts), in_sel, move |o: Opt| {
+        let input = if o.key == NONE_KEY { None } else { Some(o.key) };
+        Message::Send(Command::SetBusInput { bus: idx, input })
+    });
     let opts: Vec<Opt> = state.capture_apps.iter().map(|a| Opt { key: a.key.clone(), label: a.label.clone() }).collect();
     let sel = bus.listener.as_ref().and_then(|k| opts.iter().find(|o| &o.key == k).cloned());
-    let app_dd = dropdown("◇ SEND TO APP", opts, sel, move |o: Opt| Message::Send(Command::SetBusListener { bus: idx, app: Some(o.key) }));
+    let app_dd = dropdown("◇ SEND TO APP", clearable_opts(opts), sel, move |o: Opt| {
+        let app = if o.key == NONE_KEY { None } else { Some(o.key) };
+        Message::Send(Command::SetBusListener { bus: idx, app })
+    });
     let listening = if bus.listeners.is_empty() { text("no app assigned").size(9).color(theme::TEXT_DIM) } else { text(format!("◂ {} listening", elide(&bus.listeners[0], 12))).size(9).color(accent) };
-    let meter = Canvas::new(Meter { level: bus.level.peak(), accent }).width(Length::Fixed(20.0)).height(Length::Fixed(FADER_H));
+    // If another bus shares this exact listener key, both buses feed the
+    // same app's mic at once — legitimate (an app CAN listen to more than
+    // one bus), but easy to end up with by accident and easy to misread as
+    // "which one is actually active" (it's both, summed). Surface it instead
+    // of leaving it invisible — this is what "B1/B2/B3 all show as default
+    // mic" turned out to actually be.
+    let dup_others: Vec<&str> = bus
+        .listener
+        .as_deref()
+        .map(|key| {
+            state
+                .buses
+                .iter()
+                .enumerate()
+                .filter(|(oi, ob)| *oi != idx && ob.listener.as_deref() == Some(key))
+                .map(|(_, ob)| ob.label.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let dup_note: Element<Message> = if dup_others.is_empty() {
+        Space::with_height(0).into()
+    } else {
+        text(format!("⚠ same app also on {}", dup_others.join(", "))).size(9).color(theme::MIC_AMBER).into()
+    };
+    let meter = Canvas::new(Meter { level: bus.level, accent }).width(Length::Fixed(30.0)).height(Length::Fixed(FADER_H));
     let fad = fader(bus.volume, accent, mixer_core::model::UNITY_POS, move |v| Message::Send(Command::SetBusVolume { bus: idx, volume: v }));
     let fader_row = row![meter, Space::with_width(4), fad, Space::with_width(8), text(fmt_db(bus.volume)).size(11).color(theme::TEXT)].align_y(Alignment::Center);
     let mut mon = row![].spacing(3);
@@ -417,18 +488,18 @@ pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState, width: f32,
         let on = bus.monitor.get(ai).copied().unwrap_or(false);
         mon = mon.push(send_pill(&ab.label, on, false, false, Message::Send(Command::ToggleBusMonitor { bus: idx, a_bus: ai })));
     }
+    // Bus-to-bus: this bus's output additionally feeding another B-bus's
+    // input. Global bus indices on both sides — see `Bus.feeds` doc comment.
+    // Excludes self and A-buses: feeding a hardware-out bus isn't this
+    // feature, and self-feed would be a trivial 1-cycle.
+    let mut feed = row![].spacing(3);
+    for (oi, ob) in state.buses.iter().enumerate().filter(|(oi, ob)| *oi != idx && ob.kind == BusKind::VirtualMic) {
+        let on = bus.feeds.get(oi).copied().unwrap_or(false);
+        feed = feed.push(send_pill(&ob.label, on, false, true, Message::Send(Command::ToggleBusFeed { from: idx, to: oi })));
+    }
     let mute = wide_button("MUTE", bus.mute, theme::REC_RED, Message::Send(Command::SetBusMute { bus: idx, mute: !bus.mute }));
     let rec = rec_button(bus.recording, RecTarget::Bus(idx));
-    // SET AS DEF MIC: make this virtual mic the system default input, so apps
-    // on "default" microphone (e.g. browsers) transmit this bus's mix.
-    let is_def_mic = state.default_input == Some(idx);
-    let def_mic_btn = wide_button(
-        if is_def_mic { "★ DEFAULT MIC" } else { "SET AS DEF MIC" },
-        is_def_mic,
-        theme::MIC_AMBER,
-        Message::Send(Command::SetDefaultInput { bus: idx }),
-    );
-    let body = column![head, Space::with_height(5), app_dd, Space::with_height(3), listening, Space::with_height(6), fader_row, Space::with_height(8), text("MONITOR ON").size(8).color(theme::TEXT_DIM), Space::with_height(2), mon, Space::with_height(8), row![mute, Space::with_width(4), rec].spacing(0), Space::with_height(4), def_mic_btn]
+    let body = column![head, Space::with_height(5), input_dd, Space::with_height(4), app_dd, Space::with_height(3), listening, dup_note, Space::with_height(6), fader_row, Space::with_height(8), text("MONITOR ON").size(8).color(theme::TEXT_DIM), Space::with_height(2), mon, Space::with_height(6), text("FEED →").size(8).color(theme::TEXT_DIM), Space::with_height(2), feed, Space::with_height(8), row![mute, Space::with_width(4), rec].spacing(0)]
         .spacing(0).width(Length::Fixed(width));
     container(body).padding(10).width(Length::Fixed(width + 20.0)).style(theme::card_accent(accent)).into()
 }
@@ -436,12 +507,69 @@ pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState, width: f32,
 pub fn hw_out_slot<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState) -> Element<'a, Message> {
     let opts: Vec<Opt> = state.devices.iter().map(|d| Opt { key: d.key.clone(), label: d.label.clone() }).collect();
     let sel = bus.device.as_ref().and_then(|k| opts.iter().find(|o| &o.key == k).cloned());
-    let dd = dropdown("— select device —", opts, sel, move |o: Opt| Message::Send(Command::SetBusDevice { bus: idx, device: Some(o.key) }));
+    let dd = dropdown("— select device —", clearable_opts(opts), sel, move |o: Opt| {
+        let device = if o.key == NONE_KEY { None } else { Some(o.key) };
+        Message::Send(Command::SetBusDevice { bus: idx, device })
+    });
     let mute = button(text("M").size(10).color(if bus.mute { theme::BG_DEEP } else { theme::TEXT_DIM }))
         .style(move |_t, _s| button::Style { background: Some(iced::Background::Color(if bus.mute { theme::REC_RED } else { theme::PANEL_HI })), border: Border { color: theme::EDGE, width: 1.0, radius: 5.0.into() }, text_color: theme::TEXT_DIM, ..Default::default() })
         .padding([4, 8]).on_press(Message::Send(Command::SetBusMute { bus: idx, mute: !bus.mute }));
-    container(row![text(&bus.label).size(14).color(theme::ACCENT), Space::with_width(8), dd, Space::with_width(6), mute].align_y(Alignment::Center))
+    let top = row![text(&bus.label).size(14).color(theme::ACCENT), Space::with_width(8), dd, Space::with_width(6), mute].align_y(Alignment::Center);
+    // Direct input + meter, same feature as bus_card's — the hardware-out
+    // bus's meter reflects ONLY this assigned source (pre-fader), not the
+    // real mix reaching the speakers. Silent unless you assign one here.
+    let in_opts: Vec<Opt> = state.inputs.iter().map(|i| Opt { key: i.key.clone(), label: i.label.clone() }).collect();
+    let in_sel = bus.input.as_ref().and_then(|k| in_opts.iter().find(|o| &o.key == k).cloned());
+    let input_dd = dropdown("◆ INPUT (drives meter)", clearable_opts(in_opts), in_sel, move |o: Opt| {
+        let input = if o.key == NONE_KEY { None } else { Some(o.key) };
+        Message::Send(Command::SetBusInput { bus: idx, input })
+    });
+    let meter = Canvas::new(Meter { level: bus.level, accent: theme::ACCENT }).width(Length::Fixed(24.0)).height(Length::Fixed(36.0));
+    let bottom = row![meter, Space::with_width(6), input_dd].align_y(Alignment::Center);
+    container(column![top, Space::with_height(4), bottom].spacing(0))
         .padding(8).width(Length::Fixed(340.0)).style(theme::card).into()
+}
+
+/// A single bus's entry in `rec_panel` — a small fixed-width chip (label over
+/// a compact toggle), not the full-size `rec_button` (which is `Length::Fill`
+/// and sized for sitting alongside a MUTE button inside a strip/bus card's
+/// fixed-width body — dropped straight into a bare row it stretches to fill
+/// whatever space is available, which is what made the first version of this
+/// panel look oversized).
+fn mini_rec_chip<'a>(label: &'a str, accent: Color, recording: bool, target: RecTarget) -> Element<'a, Message> {
+    let msg = if recording {
+        Message::Send(Command::StopRecordTarget { target })
+    } else {
+        Message::Send(Command::StartRecordTarget { target })
+    };
+    let (bg, fg, edge) = if recording {
+        (theme::REC_RED, theme::BG_DEEP, theme::REC_RED)
+    } else {
+        (theme::PANEL_HI, theme::TEXT_DIM, theme::EDGE)
+    };
+    let btn = button(text(if recording { "■" } else { "●" }).size(9).color(fg).center().width(Length::Fill))
+        .style(move |_t, _s| button::Style { background: Some(iced::Background::Color(bg)), border: Border { color: edge, width: 1.0, radius: 4.0.into() }, text_color: fg, ..Default::default() })
+        .width(Length::Fixed(22.0)).padding([3, 0]).on_press(msg);
+    column![text(label).size(9).color(accent), Space::with_height(3), btn]
+        .align_x(Alignment::Center)
+        .width(Length::Fixed(34.0))
+        .into()
+}
+
+/// Consolidated recording dashboard: every bus (A then B, natural array
+/// order), each with its own compact REC toggle, so you can see/control
+/// exactly what's being recorded without hunting across scattered per-card
+/// buttons. Purely additive — the existing per-card REC buttons on
+/// `strip_card`/`bus_card` stay too; both read the same `bus.recording`
+/// field so there's no risk of the two views disagreeing.
+pub fn rec_panel<'a>(state: &'a MixerState) -> Element<'a, Message> {
+    let mut items = row![].spacing(6);
+    for (idx, bus) in state.buses.iter().enumerate() {
+        let accent = if bus.kind == BusKind::HwOutput { theme::ACCENT } else { theme::VIOLET };
+        items = items.push(mini_rec_chip(&bus.label, accent, bus.recording, RecTarget::Bus(idx)));
+    }
+    container(row![text("REC").size(9).color(theme::TEXT_DIM), Space::with_width(10), items].align_y(Alignment::Center))
+        .padding([6, 10]).style(theme::card).into()
 }
 
 // ─────────────────────────────────────────────────────── MATRIX

@@ -152,3 +152,44 @@ The Iced GUI was missing the default-device buttons. Now:
   ACTIVITY LOG tab (was tracked in state, never shown), a UI-scale stepper,
   and an editable recordings-dir field — all previously-unwired `Command`s.
 - The old egui GUI (`mixer-gui`) is removed; `mixer-gui-iced` has full parity.
+
+## v2.6.0 — routing was never actually exclusive (the real "nothing works" fix)
+
+v2.5.0's stray-link redirect only covered app→strip (playback). Real use
+turned up the same bug on the OTHER side, plus a separate mute bug — between
+them these are almost certainly why faders/DSP/mute "did nothing" and B-bus
+routing "didn't work at all" even though every topology check said the links
+were correct.
+
+- FIX (the big one): `apply_bus_listeners` (B-bus → app-mic, i.e. "send one
+  app's audio to another app") only ever ADDED the link — it never checked
+  whether the receiving app's mic ALSO had its real default microphone
+  auto-connected (WirePlumber does this synchronously the instant the capture
+  node appears, before FerroMix can react). The app heard its real mic and
+  the B-bus mixed together, permanently. Fixed with the same
+  redirect-off-the-stray-link approach already used for playback.
+- FIX: muting an A-bus (hardware output) never actually cut the link to the
+  hardware sink — only the mute *flag* was set, and (per the existing
+  strip-mute finding) a null-sink's mute flag alone doesn't stop its monitor
+  from emitting. Muting your main output bus did not silence your speakers.
+- FIX (found immediately by live-testing the fix above): if the same app is
+  assigned as listener to TWO B-buses at once (a real config the testing
+  session had — Discord's mic on both B1 and B2), the redirect logic treated
+  each bus as "stray" relative to the other and fought itself every
+  reconcile pass, bouncing Discord's mic between B1 and B2 forever. Both
+  `stray_destinations`/`stray_sources` now take the full set of an app's
+  legitimate FerroMix targets, not just one, so multiple simultaneous
+  assignments coexist instead of fighting.
+- HARDENED: the playback redirect was a one-shot latch — if a stray link
+  reappeared later without the app's node itself disappearing (a device/
+  profile change, a role rescan), it would never be caught again. The
+  redirect check now runs every reconcile pass (cheap no-op once clean);
+  only the `target.object` metadata *write* stays latched, since repeating
+  that specifically is what caused a destroy/recreate war in earlier testing.
+- Added `packaging/wireplumber/91-ferromix-disable-role-loopbacks.conf` — an
+  optional, documented, user-installed WirePlumber override that removes
+  Fedora's role-based loopback sinks entirely, closing the playback-side race
+  proactively instead of reactively. See README.md's Fedora section.
+- Lesson learned, and applied going forward: `pw-dump`/`pw-link` showing a
+  link exists is NOT sufficient verification — it doesn't show whether a
+  COMPETING link also exists. Verification now checks exclusivity.

@@ -1,5 +1,5 @@
 Name:           ferromix2
-Version:        2.4.0
+Version:        2.6.0
 Release:        1%{?dist}
 Summary:        Voicemeeter-style virtual audio mixer for PipeWire
 
@@ -31,7 +31,10 @@ runs per-strip noise-gate/compressor DSP.
 
 This package installs the daemon (%{name}-daemon, owns the PipeWire graph and
 runs as a systemd --user service) and the Iced-based GUI (%{name}, a disposable
-IPC client — closing it never interrupts audio).
+IPC client — closing it never interrupts audio). Also ships (but does NOT
+apply automatically — see %doc) an optional WirePlumber override that
+disables Fedora's role-based loopback routing, which otherwise races
+FerroMix for control of PipeWire-pulse clients like Spotify and Firefox.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -48,6 +51,7 @@ install -Dm644 assets/%{name}.svg %{buildroot}%{_datadir}/icons/hicolor/scalable
 
 %files
 %license LICENSE
+%doc packaging/wireplumber/91-ferromix-disable-role-loopbacks.conf
 %{_bindir}/%{name}-daemon
 %{_bindir}/%{name}
 %{_userunitdir}/%{name}.service
@@ -55,6 +59,14 @@ install -Dm644 assets/%{name}.svg %{buildroot}%{_datadir}/icons/hicolor/scalable
 %{_datadir}/icons/hicolor/scalable/apps/%{name}.svg
 
 %changelog
+* Tue Jul 21 2026 FerroMix contributors <noreply@example.com> - 2.6.0-1
+- Fixed B-bus -> app-mic routing never being exclusive (the app's real
+  default microphone stayed linked alongside the B-bus, mixing both
+  permanently) — same bug class as the earlier playback-side fix, now
+  covering both directions and hardened against silent recurrence.
+- Fixed A-bus mute not actually cutting the hardware-output link.
+- Ship an optional WirePlumber override (see %doc) that proactively removes
+  the role-based-loopback race for playback instead of only reacting to it.
 * Mon Jul 20 2026 FerroMix contributors <noreply@example.com> - 2.4.0-1
 - Initial RPM packaging: daemon + Iced GUI, systemd --user service, desktop
   entry and icon, LADSPA compressor dependency.

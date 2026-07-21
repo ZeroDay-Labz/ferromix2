@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Proves whether mix-minus (a B-bus virtual mic) is actually reaching the app
-# that's supposed to be listening to it. Companion to trace_strip.sh, which
-# only covers strip INPUTS — this covers the B-bus -> app-capture side.
-# Read-only. Usage: ./trace_mixminus.sh   (run while the app you assigned a
-# B-bus to, e.g. Discord, is open and its mic is presumably live)
+# that's supposed to be listening to it — AND that it's the ONLY thing
+# reaching it. Companion to trace_strip.sh, which covers strip INPUTS; this
+# covers the B-bus -> app-capture side. Read-only.
+# Usage: ./trace_mixminus.sh   (run while the app you assigned a B-bus to,
+# e.g. Discord, is open and its mic is presumably live)
 echo "======== FERROMIX2 MIX-MINUS TRACE $(date +%H:%M:%S) ========"
 echo
 
@@ -16,7 +17,11 @@ for o in json.load(sys.stdin):
     p=(o.get("info") or {}).get("props") or {}
     name=p.get("node.name","")
     if name.startswith("ferromix.bus.") or (name.startswith("ferromix.") and p.get("media.class")=="Audio/Source/Virtual"):
-        print(f"  id={o[\"id\"]:<5} {name:24} autoconnect={p.get(\"node.autoconnect\",\"?\")}  linger={p.get(\"object.linger\",\"?\")}  class={p.get(\"media.class\",\"?\")}")
+        oid=o["id"]
+        auto=p.get("node.autoconnect","?")
+        linger=p.get("object.linger","?")
+        cls=p.get("media.class","?")
+        print(f"  id={oid:<5} {name:24} autoconnect={auto}  linger={linger}  class={cls}")
 '
 echo
 
@@ -24,36 +29,64 @@ echo "### 2. Actual links OUT of each B-bus right now (pw-link ground truth)"
 pw-link -l 2>/dev/null | grep -B1 -i "ferromix.bus" | grep -v "^--" | sed 's/^/  /'
 echo
 
-echo "### 3. Apps with a live capture (microphone) stream, and where their"
-echo "   target.object metadata currently points"
-pw-dump 2>/dev/null | python3 -c '
-import sys,json
-d=json.load(sys.stdin)
-for o in d:
-    p=(o.get("info") or {}).get("props") or {}
-    if p.get("media.class")=="Stream/Input/Audio":
-        tgt=p.get("target.object") or p.get("node.target") or "(default / unset)"
-        app=p.get("application.name") or p.get("application.process.binary","?")
-        st=(o.get("info") or {}).get("state","")
-        print(f"  [{st:9}] {app:20} node.name={p.get(\"node.name\",\"?\"):24} target.object={tgt}")
+echo "### 3. THE EXCLUSIVITY CHECK — for every app capture node fed by a"
+echo "   FerroMix B-bus, is a B-bus the ONLY thing feeding it? A real mic"
+echo "   or any other source showing up here means the app is hearing BOTH"
+echo "   mixed together — this was the actual 'B-bus routing doesn't work'"
+echo "   bug (WirePlumber auto-connects the app's real default mic before"
+echo "   FerroMix's own link can land, and nothing used to cut it)."
+python3 -c '
+import subprocess, json
+
+dump = json.loads(subprocess.run(["pw-dump"], capture_output=True, text=True).stdout or "[]")
+names = {}
+bus_ids = set()
+cap_ids = []
+for o in dump:
+    p = (o.get("info") or {}).get("props") or {}
+    name = p.get("node.name", "")
+    if "node.name" in p:
+        names[o["id"]] = name
+    if name.startswith("ferromix.bus."):
+        bus_ids.add(o["id"])
+    if p.get("media.class") == "Stream/Input/Audio" and not name.startswith("ferromix."):
+        cap_ids.append((o["id"], p.get("application.name") or p.get("application.process.binary", "?")))
+
+# out_node -> set of in_nodes, from live link objects (ground truth).
+feeds = {}
+for o in dump:
+    if o.get("type", "").endswith("Link"):
+        info = o.get("info") or {}
+        out_id, in_id = info.get("output-node-id"), info.get("input-node-id")
+        feeds.setdefault(in_id, set()).add(out_id)
+
+any_bus_listener = False
+for cap_id, app in cap_ids:
+    sources = feeds.get(cap_id, set())
+    bus_sources = sources & bus_ids
+    if not bus_sources:
+        continue  # this app is not a FerroMix bus listener at all
+    any_bus_listener = True
+    stray = sources - bus_ids
+    bus_names = ", ".join(names.get(b, str(b)) for b in bus_sources)
+    print(f"  {app:20} [id={cap_id}] fed by bus(es): {bus_names}")
+    if stray:
+        stray_names = ", ".join(names.get(s, str(s)) for s in stray)
+        print(f"    !! ALSO fed by: {stray_names}  <-- EXCLUSIVITY BROKEN, this is the bug")
+    else:
+        print(f"    OK — exclusively fed by FerroMix bus(es), nothing else")
+
+if not any_bus_listener:
+    print("  (no app currently has a FerroMix B-bus feeding its microphone —")
+    print("   assign one via SEND TO APP on a bus card first)")
 '
 echo
 
-echo "### 4. Strip -> bus sends the daemon believes are active (from the log,"
-echo "   if you are piping journalctl/daemon stdout, grep for these lines"
-echo "   yourself — this script cannot read the daemon's in-memory state):"
-echo "     'MIC LINK bus.N -> <app>'      = listener link was drawn"
-echo "     '⚠ feedback loop blocked'      = a send was refused by the guard"
-echo "     'UNLINK ... -> ...'            = a link was torn down"
+echo "### 4. Daemon log lines to grep for (if piping journalctl/daemon stdout):"
+echo "     'MIC LINK bus.N -> <app>'                = listener link was drawn"
+echo "     'REDIRECT <app> off <node> (mic now ...)' = a stray link was cut"
+echo "     '⚠ feedback loop blocked'                 = a send was refused by the guard"
+echo "     'UNLINK ... -> ...'                       = a link was torn down"
 echo
 
-echo "### 5. THE KEY QUESTION: for a B-bus you assigned as an app's mic, does"
-echo "   section 2 show a real link INTO that app's capture node from"
-echo "   section 3? If section 1/2 show no link at all, the listener link"
-echo "   was never drawn (or was torn down and never redrawn) — check the"
-echo "   daemon log for 'MIC LINK' around when you made the assignment."
-echo "   If the link EXISTS but the app still doesn't hear anything, the"
-echo "   B-bus itself may not be receiving any strip sends — check the"
-echo "   PATCH MATRIX tab for that bus's column."
-echo
 echo "======== paste everything above ========"

@@ -194,11 +194,35 @@ pub struct Bus {
     #[serde(default)]
     pub name: String,
     /// monitor[a_bus_idx] — send this virtual mic to a hardware out so you can
-    /// hear exactly what the far end hears.
+    /// hear exactly what the far end hears. Indexed by position *among
+    /// HwOutput buses only* (A-local), unlike `assign`/`feeds` below.
     #[serde(default)]
     pub monitor: Vec<bool>,
+    /// feeds[bus_idx] — this bus's output is additionally routed into that
+    /// bus's input, alongside whatever strips send to it. Indexed by the
+    /// *global* bus index (same convention as `Strip.assign`), not A-local
+    /// like `monitor`. Only meaningful between VirtualMic buses.
+    #[serde(default)]
+    pub feeds: Vec<bool>,
     pub kind: BusKind,
     pub device: Option<String>,
+    /// A directly-assigned source (app or hw device) this bus's METER should
+    /// track — pre-fader, source-only, never the mixed content routed in via
+    /// `assign`/`feeds`. `None` means the meter is silent, even while real
+    /// audio is flowing through the bus from routed sends.
+    ///
+    /// Deliberately metering-only: unlike `Strip.input`, this does NOT link
+    /// the source's audio into the bus's actual mix. Doing that would create
+    /// a real feedback path whenever the same app is also this bus's
+    /// `listener` (SEND TO APP) — e.g. assigning Discord's own voice as B2's
+    /// input while B2 also feeds Discord's mic would route Discord's incoming
+    /// voice right back into what it captures, tripping its own echo
+    /// cancellation and suppressing the real mic signal.
+    pub input: Option<String>,
+    #[serde(default)]
+    pub input_label: String,
+    #[serde(default)]
+    pub input_live: bool,
     /// Apps currently capturing from this virtual mic — who is actually listening.
     #[serde(default)]
     pub listeners: Vec<String>,
@@ -242,10 +266,6 @@ pub struct MixerState {
     /// Where bus recordings are written.
     pub recordings_dir: String,
     pub feedback_guard: bool,
-    /// Strip index that is currently the system default output (if any).
-    pub default_output: Option<usize>,
-    /// Bus index that is currently the system default input (if any).
-    pub default_input: Option<usize>,
     /// UI scale factor. 0.0 = auto (follow the monitor's DPI), else applied
     /// directly as the window's scale factor.
     pub ui_scale: f32,

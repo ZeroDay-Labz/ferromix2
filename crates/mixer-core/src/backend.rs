@@ -17,10 +17,6 @@ pub enum BackendEvent {
     Level(LevelKey, Level),
     /// (strip_idx, bus_idx) routes refused because they would close a loop.
     Feedback(Vec<(usize, usize)>),
-    /// Which strip (if any) is the current system default output.
-    DefaultOutput(Option<usize>),
-    /// Which bus (if any) is the current system default input.
-    DefaultInput(Option<usize>),
     Log(String),
     RecordStopped(RecTarget),
 }
@@ -54,16 +50,19 @@ pub trait AudioBackend: Send {
 
     fn set_feedback_guard(&mut self, on: bool) -> BackendResult;
 
-    /// Make strip `idx`'s device the system default OUTPUT. Apps that don't let
-    /// you pick a device (Zoiper, plenty of others) follow the system default —
-    /// this is how you get them onto a strip.
-    fn set_default_output_strip(&mut self, idx: usize) -> BackendResult;
-    /// Make bus `idx`'s virtual mic the system default INPUT, for apps that
-    /// can't pick their microphone either.
-    fn set_default_input_bus(&mut self, idx: usize) -> BackendResult;
-
     /// Send a bus into a hardware out, so you can monitor what the far end hears.
     fn set_bus_monitor(&mut self, bus_idx: usize, a_bus_idx: usize, on: bool) -> BackendResult;
+
+    /// Route bus `from`'s output additionally into bus `to`'s input, alongside
+    /// whatever strips send to it. Global bus indices on both sides.
+    fn set_bus_feed(&mut self, from: usize, to: usize, on: bool) -> BackendResult;
+
+    /// Pick which source bus `idx`'s METER tracks — pre-fader, source-only.
+    /// `None` clears it (silent meter). Unlike `set_strip_input`, this is
+    /// metering-only: it does NOT link the source's audio into the bus's mix
+    /// (see `Bus.input`'s doc comment in `model.rs` for why that would be
+    /// actively harmful for a bus that's also a `set_bus_listener` target).
+    fn set_bus_input(&mut self, idx: usize, source_key: Option<String>) -> BackendResult;
 
     /// Point an app's MICROPHONE at bus `bus_idx` — i.e. make Discord listen to
     /// B1 without opening Discord's settings. `None` releases the app.

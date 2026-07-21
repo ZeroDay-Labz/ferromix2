@@ -20,16 +20,23 @@ pub enum Command {
     SetBusVolume { bus: usize, volume: f32 },
     SetBusMute { bus: usize, mute: bool },
     SetBusDevice { bus: usize, device: Option<String> },
+    /// Which source a bus's METER tracks (pre-fader, source-only) —
+    /// metering-only, unlike `SetStripInput`: does not route audio into the
+    /// bus's mix, independent of whatever strips are routed into it via
+    /// `ToggleAssign`. See `Bus.input`'s doc comment for why.
+    SetBusInput { bus: usize, input: Option<String> },
     SetRecordingsDir { path: String },
     SetUiScale { scale: f32 },
     SetStripName { strip: usize, name: String },
     SetBusName { bus: usize, name: String },
     ToggleBusMonitor { bus: usize, a_bus: usize },
+    /// Route bus `from`'s output additionally into bus `to`'s input. Refused
+    /// (no-op) if `to` already feeds `from` — direct 2-cycles only are
+    /// guarded against; longer chains are not, by design (see plan notes).
+    ToggleBusFeed { from: usize, to: usize },
     SetBusListener { bus: usize, app: Option<String> },
     StartRecordTarget { target: RecTarget },
     StopRecordTarget { target: RecTarget },
-    SetDefaultOutput { strip: usize },
-    SetDefaultInput { bus: usize },
     SetFeedbackGuard { on: bool },
     AddStrip,
     Save,
@@ -73,6 +80,10 @@ fn initial_state(cfg: &Config) -> MixerState {
             label: b.label.clone(),
             name: b.name.clone(),
             monitor: Vec::new(),
+            feeds: Vec::new(),
+            input: b.input.clone(),
+            input_label: b.input.clone().unwrap_or_else(|| "—".into()),
+            input_live: false,
             listener: b.listener.clone(),
             kind: b.bus_kind(),
             device: b.device.clone(),
@@ -85,10 +96,11 @@ fn initial_state(cfg: &Config) -> MixerState {
         })
         .collect();
     let n_a = buses.iter().filter(|b| b.kind == BusKind::HwOutput).count();
+    let n_bus = buses.len();
     let mut buses = buses;
-    for (i, b) in buses.iter_mut().enumerate() {
-        let _ = i;
+    for b in buses.iter_mut() {
         b.monitor = vec![false; n_a];
+        b.feeds = vec![false; n_bus];
     }
     // restore saved monitor flags by A-bus label
     let a_labels: Vec<String> = cfg
@@ -97,11 +109,20 @@ fn initial_state(cfg: &Config) -> MixerState {
         .filter(|b| b.bus_kind() == BusKind::HwOutput)
         .map(|b| b.label.clone())
         .collect();
+    // restore saved feed flags by (any) bus label
+    let all_labels: Vec<String> = cfg.buses.iter().map(|b| b.label.clone()).collect();
     for (bi, bcfg) in cfg.buses.iter().enumerate() {
         if let Some(b) = buses.get_mut(bi) {
             for (ai, al) in a_labels.iter().enumerate() {
                 if bcfg.monitor.iter().any(|m| m.eq_ignore_ascii_case(al)) {
                     if let Some(slot) = b.monitor.get_mut(ai) {
+                        *slot = true;
+                    }
+                }
+            }
+            for (gi, gl) in all_labels.iter().enumerate() {
+                if bcfg.feeds.iter().any(|f| f.eq_ignore_ascii_case(gl)) {
+                    if let Some(slot) = b.feeds.get_mut(gi) {
                         *slot = true;
                     }
                 }
@@ -141,8 +162,6 @@ fn initial_state(cfg: &Config) -> MixerState {
         capture_apps: Vec::new(),
         recordings_dir: cfg.recordings_dir().display().to_string(),
         feedback_guard: cfg.feedback_guard,
-        default_output: None,
-        default_input: None,
         ui_scale: cfg.ui_scale,
         log: Vec::new(),
     }
@@ -197,6 +216,27 @@ fn refresh_strip_inputs(state: &mut MixerState) {
     }
 }
 
+/// Same resolution as `refresh_strip_inputs`, for a bus's directly-assigned
+/// input. Applies to every bus regardless of kind (A and B alike).
+fn refresh_bus_inputs(state: &mut MixerState) {
+    let inputs = state.inputs.clone();
+    for b in &mut state.buses {
+        if let Some(key) = b.input.clone() {
+            if let Some(opt) = resolve_input(&inputs, &key) {
+                b.input = Some(opt.key.clone());
+                b.input_label = opt.label.clone();
+                b.input_live = opt.live;
+            } else {
+                b.input_label = format!("{key} (offline)");
+                b.input_live = false;
+            }
+        } else {
+            b.input_label = "—".into();
+            b.input_live = false;
+        }
+    }
+}
+
 fn run(
     backend: &mut dyn AudioBackend,
     events: Receiver<BackendEvent>,
@@ -223,12 +263,20 @@ fn run(
             push_strip(backend, i, s);
         }
         for (bi, b) in st.buses.iter().enumerate() {
+            if b.input.is_some() {
+                let _ = backend.set_bus_input(bi, b.input.clone());
+            }
             if b.listener.is_some() {
                 let _ = backend.set_bus_listener(bi, b.listener.clone());
             }
             for (ai, on) in b.monitor.iter().enumerate() {
                 if *on {
                     let _ = backend.set_bus_monitor(bi, ai, true);
+                }
+            }
+            for (gi, on) in b.feeds.iter().enumerate() {
+                if *on {
+                    let _ = backend.set_bus_feed(bi, gi, true);
                 }
             }
         }
@@ -250,11 +298,19 @@ fn run(
                         .map(|s: SourceInfo| InputOption { key: s.key, label: s.label, kind: s.kind, live: true })
                         .collect();
                     refresh_strip_inputs(&mut st);
+                    refresh_bus_inputs(&mut st);
                     // Re-link any strip whose chosen source just (re)appeared.
                     let strips = st.strips.clone();
                     for (i, s) in strips.iter().enumerate() {
                         if s.input.is_some() {
                             let _ = backend.set_strip_input(i, s.input.clone());
+                        }
+                    }
+                    // Same for any bus with a direct input assigned.
+                    let buses = st.buses.clone();
+                    for (i, b) in buses.iter().enumerate() {
+                        if b.input.is_some() {
+                            let _ = backend.set_bus_input(i, b.input.clone());
                         }
                     }
                 }
@@ -308,8 +364,6 @@ fn run(
                     }
                     st.feedback = pairs;
                 }
-                BackendEvent::DefaultOutput(idx) => st.default_output = idx,
-                BackendEvent::DefaultInput(idx) => st.default_input = idx,
                 BackendEvent::Log(l) => st.push_log(format!("{} {l}", ts())),
                 BackendEvent::RecordStopped(t) => match t {
                     RecTarget::Bus(i) => {
@@ -395,6 +449,16 @@ fn run(
                     st.push_log(format!("{} {} → device {}", ts(), bl, device.as_deref().unwrap_or("<default>")));
                     let _ = backend.set_bus_device(bus, device);
                 }
+                Command::SetBusInput { bus, input } => {
+                    if let Some(b) = st.buses.get_mut(bus) {
+                        b.input = input.clone();
+                    }
+                    refresh_bus_inputs(&mut st);
+                    let label = st.buses.get(bus).map(|b| b.input_label.clone()).unwrap_or_else(|| "—".into());
+                    let bl = st.buses.get(bus).map(|b| b.label.clone()).unwrap_or_default();
+                    st.push_log(format!("{} {} input → {}", ts(), bl, label));
+                    let _ = backend.set_bus_input(bus, input);
+                }
                 Command::StartRecordTarget { target } => {
                     let label = match target {
                         RecTarget::Bus(i) => st.buses.get(i).map(|b| b.display_name()).unwrap_or_default(),
@@ -474,6 +538,28 @@ fn run(
                     }
                     let _ = backend.set_bus_monitor(bus, a_bus, on);
                 }
+                Command::ToggleBusFeed { from, to } => {
+                    // Direct 2-cycle guard only: refuse turning `from → to` on
+                    // if `to → from` is already on. Longer chains (B1→B2→B3→B1)
+                    // are not detected — a deliberate scope boundary, not a gap
+                    // (real Voicemeeter doesn't have bus-to-bus routing at all).
+                    let already_reverse = st.buses.get(to).and_then(|b| b.feeds.get(from)).copied().unwrap_or(false);
+                    let currently_on = st.buses.get(from).and_then(|b| b.feeds.get(to)).copied().unwrap_or(false);
+                    if !currently_on && already_reverse {
+                        let fl = st.buses.get(from).map(|b| b.label.clone()).unwrap_or_default();
+                        let tl = st.buses.get(to).map(|b| b.label.clone()).unwrap_or_default();
+                        st.push_log(format!("{} refused: {} already feeds {} (would 2-cycle)", ts(), tl, fl));
+                    } else {
+                        let mut on = false;
+                        if let Some(b) = st.buses.get_mut(from) {
+                            if let Some(f) = b.feeds.get_mut(to) {
+                                *f = !*f;
+                                on = *f;
+                            }
+                        }
+                        let _ = backend.set_bus_feed(from, to, on);
+                    }
+                }
                 Command::SetRecordingsDir { path } => {
                     let p = std::path::PathBuf::from(shellexpand_home(&path));
                     config.recordings_dir = Some(p.clone());
@@ -485,15 +571,6 @@ fn run(
                     config.ui_scale = scale.clamp(0.5, 3.0);
                     st.ui_scale = config.ui_scale;
                     let _ = config.save();
-                }
-                Command::SetDefaultOutput { strip } => {
-                    st.push_log(format!("{} system default output → Input {}", ts(), strip + 1));
-                    let _ = backend.set_default_output_strip(strip);
-                }
-                Command::SetDefaultInput { bus } => {
-                    let bl = st.buses.get(bus).map(|b| b.label.clone()).unwrap_or_default();
-                    st.push_log(format!("{} system default input → {}", ts(), bl));
-                    let _ = backend.set_default_input_bus(bus);
                 }
                 Command::SetFeedbackGuard { on } => {
                     config.feedback_guard = on;
@@ -515,16 +592,25 @@ fn run(
                         .filter(|b| b.kind == BusKind::HwOutput)
                         .map(|b| b.label.clone())
                         .collect();
+                    let all_labels: Vec<String> = st.buses.iter().map(|b| b.label.clone()).collect();
                     config.buses = st.buses.iter().map(|b| crate::config::BusCfg {
                         label: b.label.clone(),
                         name: b.name.clone(),
                         listener: b.listener.clone(),
+                        input: b.input.clone(),
                         monitor: b
                             .monitor
                             .iter()
                             .enumerate()
                             .filter(|(_, on)| **on)
                             .filter_map(|(ai, _)| a_labels.get(ai).cloned())
+                            .collect(),
+                        feeds: b
+                            .feeds
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, on)| **on)
+                            .filter_map(|(gi, _)| all_labels.get(gi).cloned())
                             .collect(),
                         kind: match b.kind { BusKind::HwOutput => "hw", BusKind::VirtualMic => "virtual" }.into(),
                         device: b.device.clone(),
@@ -548,7 +634,11 @@ fn run(
         }
 
         let dt = last_decay.elapsed();
-        if dt >= Duration::from_millis(33) {
+        // 16ms to match the GUI's faster (~60Hz) poll rate — smoother meter
+        // decay. The 0.82 constant is normalized per-33ms via dt/0.033 below,
+        // so the overall decay RATE per second is unchanged, just applied in
+        // smaller, more frequent steps.
+        if dt >= Duration::from_millis(16) {
             last_decay = Instant::now();
             let decay = 0.82_f32.powf(dt.as_secs_f32() / 0.033);
             let mut st = state.lock().unwrap();

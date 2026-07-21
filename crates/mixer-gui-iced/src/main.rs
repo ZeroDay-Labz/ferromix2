@@ -209,7 +209,13 @@ impl App {
 
     fn subscription(&self) -> Subscription<Message> {
         // Drain the link worker's channel on a timer and feed events in.
-        let poll = iced::time::every(std::time::Duration::from_millis(33)).map(|_| {
+        // 16ms (~60Hz) rather than the old 33ms (~30Hz) — snappier meters.
+        // Matched by link.rs's own poll interval below; no point draining
+        // faster than fresh state actually arrives. This is a polling
+        // architecture, so there's a real latency floor here (~one poll
+        // interval, now ~16ms instead of ~33ms) — not literally zero, but
+        // beyond typical human perception for a VU meter.
+        let poll = iced::time::every(std::time::Duration::from_millis(16)).map(|_| {
             let mut guard = LINK_RX.lock().unwrap();
             if let Some(rx) = guard.as_ref() {
                 if let Ok(ev) = rx.try_recv() {
@@ -256,7 +262,7 @@ impl App {
         let logo = row![
             text("FERRO").size(20).color(theme::TEXT),
             text("MIX").size(20).color(theme::ACCENT),
-            text("2  v2.4").size(11).color(theme::TEXT_DIM),
+            text("2  v2.6").size(11).color(theme::TEXT_DIM),
         ]
         .align_y(iced::Alignment::Center);
 
@@ -372,6 +378,8 @@ impl App {
 
         let console = column![
             hw,
+            Space::with_height(10),
+            widgets::rec_panel(state),
             Space::with_height(14),
             labels,
             Space::with_height(6),

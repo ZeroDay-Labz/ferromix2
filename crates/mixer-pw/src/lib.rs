@@ -31,13 +31,13 @@ pub(crate) enum PwCmd {
     SetStripAssign { idx: usize, bus: usize, on: bool },
     SetStripDsp { idx: usize, dsp: StripDsp },
     SetFeedbackGuard { on: bool },
-    SetDefaultOutput { idx: usize },
-    SetDefaultInput { idx: usize },
     EnsureBus { idx: usize, label: String, kind: BusKind },
     SetBusDevice { idx: usize, device: Option<String> },
     SetBusVolume { idx: usize, volume: f32 },
     SetBusMute { idx: usize, mute: bool },
     SetBusMonitor { bus: usize, a_bus: usize, on: bool },
+    SetBusFeed { from: usize, to: usize, on: bool },
+    SetBusInput { idx: usize, source_key: Option<String> },
     SetBusListener { bus: usize, app_key: Option<String> },
     StartRecord { target: RecTarget, path: PathBuf },
     StopRecord { target: RecTarget },
@@ -90,12 +90,6 @@ impl AudioBackend for PwBackend {
     fn set_feedback_guard(&mut self, on: bool) -> BackendResult {
         self.send(PwCmd::SetFeedbackGuard { on })
     }
-    fn set_default_output_strip(&mut self, idx: usize) -> BackendResult {
-        self.send(PwCmd::SetDefaultOutput { idx })
-    }
-    fn set_default_input_bus(&mut self, idx: usize) -> BackendResult {
-        self.send(PwCmd::SetDefaultInput { idx })
-    }
     fn ensure_bus(&mut self, idx: usize, label: &str, kind: BusKind) -> BackendResult {
         self.send(PwCmd::EnsureBus { idx, label: label.to_string(), kind })
     }
@@ -110,6 +104,12 @@ impl AudioBackend for PwBackend {
     }
     fn set_bus_monitor(&mut self, bus_idx: usize, a_bus_idx: usize, on: bool) -> BackendResult {
         self.send(PwCmd::SetBusMonitor { bus: bus_idx, a_bus: a_bus_idx, on })
+    }
+    fn set_bus_feed(&mut self, from: usize, to: usize, on: bool) -> BackendResult {
+        self.send(PwCmd::SetBusFeed { from, to, on })
+    }
+    fn set_bus_input(&mut self, idx: usize, source_key: Option<String>) -> BackendResult {
+        self.send(PwCmd::SetBusInput { idx, source_key })
     }
     fn set_bus_listener(&mut self, bus_idx: usize, app_key: Option<String>) -> BackendResult {
         self.send(PwCmd::SetBusListener { bus: bus_idx, app_key })

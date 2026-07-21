@@ -49,6 +49,8 @@ enum Slot {
     StripIn(usize),
     /// bus monitor -> A-bus (hear what the far end hears)
     Monitor(usize, usize),
+    /// bus `from` monitor -> bus `to` input (bus-to-bus routing)
+    Feed(usize, usize),
     /// strip device monitor -> bus
     Send(usize, usize),
     /// bus monitor -> hardware sink
@@ -80,6 +82,8 @@ struct Desired {
     bus_dev: HashMap<usize, Option<String>>,
     bus_vol: HashMap<usize, f32>,
     bus_mute: HashMap<usize, bool>,
+    /// bus -> the source key directly linked into it (mirrors `strip_input`).
+    bus_input: HashMap<usize, String>,
 }
 
 #[derive(Default)]
@@ -110,6 +114,9 @@ struct WorkerState {
     recorders: HashMap<RecTarget, recorder::Recorder>,
     /// (bus, a_bus) monitor sends: hear what a virtual mic is sending.
     monitors: HashSet<(usize, usize)>,
+    /// (from, to) bus-to-bus feeds: `from`'s output additionally routed into
+    /// `to`'s input.
+    feeds: HashSet<(usize, usize)>,
     /// bus -> app key whose MICROPHONE we point at it.
     bus_listener: HashMap<usize, String>,
     /// capture node -> bus name we already pointed it at.
@@ -126,6 +133,17 @@ struct WorkerState {
     /// appears in the registry after its module loads. Both must be `Some`
     /// before reconcile splices the DSP path in.
     dsp_nodes: HashMap<usize, (Option<NodeId>, Option<NodeId>)>,
+    /// strip -> the raw `node.name` of the source its VU meter currently taps
+    /// directly (pre-fader: the source's own output, not the strip's
+    /// volume-controlled node — see `sync_prefader_tap`). Tracked so the tap
+    /// is only torn down and recreated when the resolved source actually
+    /// changes, not on every reconcile pass.
+    strip_tap_src: HashMap<usize, String>,
+    /// Same as `strip_tap_src`, for a bus's directly-assigned input (if any).
+    /// A bus with no entry here (and no `desired.bus_input` entry) has NO
+    /// tap at all — its meter is silent, never falling back to the bus's own
+    /// (mixed/routed) node. See `sync_bus_prefader_tap`.
+    bus_tap_src: HashMap<usize, String>,
 }
 
 #[derive(Clone)]
@@ -350,10 +368,13 @@ fn adopt_buses(ctx: &Ctx) {
                 if let Some(m) = st.desired.bus_mute.get(&idx).copied() {
                     let _ = virtual_dev::set_node_mute(&node, m);
                 }
-                let cap_sink = kind == BusKind::HwOutput; // sink monitor vs virtual source out
-                if let Ok(t) = tap::Tap::new(&ctx.core, LevelKey::Bus(idx), &name, cap_sink, ctx.ev_tx.clone()) {
-                    st.taps.insert(LevelKey::Bus(idx), t);
-                }
+                let _ = kind;
+                // No tap here: a bus's meter is pre-fader and source-only,
+                // driven entirely by its directly-assigned `input` (mirrors
+                // strips — see `sync_bus_prefader_tap`). With no input
+                // assigned the meter stays silent, even though real audio
+                // may still be flowing through the bus from routed sends —
+                // `reconcile()` step 1b is the sole owner of this tap.
                 st.bus_nodes.insert(idx, (id, node));
                 ready.push((idx, id));
             }
@@ -415,10 +436,11 @@ fn adopt_strips(ctx: &Ctx) {
             if let Some(mu) = st.desired.strip_mute.get(&idx).copied() {
                 let _ = virtual_dev::set_node_mute(&node, mu);
             }
-            // A strip is a sink: meter its monitor.
-            if let Ok(t) = tap::Tap::new(&ctx.core, LevelKey::Strip(idx), &name, true, ctx.ev_tx.clone()) {
-                st.taps.insert(LevelKey::Strip(idx), t);
-            }
+            // No tap here: a strip's meter is pre-fader (see
+            // `sync_prefader_tap`), which needs a resolved SOURCE node, not
+            // this strip's own node — `reconcile()` step 1 sets it up (or
+            // leaves it silent if there's no source yet) on the very next
+            // pass, which always follows adoption.
             st.strip_nodes.insert(idx, (id, node));
             ready.push((idx, id));
         }
@@ -503,6 +525,76 @@ fn resolve_source(graph: &Graph, key: &str) -> Vec<NodeId> {
         })
         .map(|n| n.id)
         .collect()
+}
+
+/// Point strip `idx`'s VU meter tap at its own resolved SOURCE node instead
+/// of the strip's own volume-controlled node — genuinely pre-fader, since a
+/// source is entirely upstream of the fader's `channelVolumes`
+/// (`virtual_dev.rs`'s `monitor.channel-volumes = true` is what makes the
+/// strip's OWN monitor follow the fader — tapping the source instead sits
+/// before that entirely). This is also what makes the meter source-only: it
+/// shows exactly what that one app/device is producing, never audio that
+/// happens to arrive at the strip's OUTPUT via routing (there isn't any —
+/// strips are pure destinations for playback, nothing plays back into them
+/// except their own configured source).
+///
+/// `src` is the strip's first resolved input node this pass (`None` if it
+/// has no live source right now, e.g. input cleared or the app closed) — the
+/// tap is torn down and left absent in that case, so the meter reads silent
+/// rather than showing stale/wrong levels. Re-attaches the tap only when the
+/// resolved source's `node.name` actually changes, so this is cheap to call
+/// on every reconcile pass (the common case is a no-op comparison).
+fn sync_prefader_tap(ctx: &Ctx, st: &mut WorkerState, idx: usize, src: Option<NodeId>) {
+    let want_name = src.and_then(|id| st.graph.nodes.get(&id)).map(|n| n.name.clone());
+    if st.strip_tap_src.get(&idx) == want_name.as_ref() {
+        return;
+    }
+    st.taps.remove(&LevelKey::Strip(idx));
+    match &want_name {
+        Some(name) => match tap::Tap::new(&ctx.core, LevelKey::Strip(idx), name, false, ctx.ev_tx.clone()) {
+            Ok(t) => {
+                st.taps.insert(LevelKey::Strip(idx), t);
+                st.strip_tap_src.insert(idx, name.clone());
+            }
+            Err(e) => {
+                log::warn!("pre-fader tap for strip {idx} on {name} FAILED: {e}");
+                st.strip_tap_src.remove(&idx);
+            }
+        },
+        None => {
+            st.strip_tap_src.remove(&idx);
+        }
+    }
+}
+
+/// Same idea as `sync_prefader_tap`, for a bus's directly-assigned `input`.
+/// Applies uniformly to A-buses and B-buses — a bus's meter reflects ONLY
+/// this directly-assigned source, pre-fader, never the mixed content routed
+/// in via the strip send matrix (`assign`) or bus-to-bus feeds (`feeds`).
+/// `src` is `None` whenever the bus has no `input` assigned (or it hasn't
+/// resolved to a live node yet) — the tap is simply absent in that case, so
+/// the meter reads silent rather than falling back to any mixed content.
+fn sync_bus_prefader_tap(ctx: &Ctx, st: &mut WorkerState, idx: usize, src: Option<NodeId>) {
+    let want_name = src.and_then(|id| st.graph.nodes.get(&id)).map(|n| n.name.clone());
+    if st.bus_tap_src.get(&idx) == want_name.as_ref() {
+        return;
+    }
+    st.taps.remove(&LevelKey::Bus(idx));
+    match &want_name {
+        Some(name) => match tap::Tap::new(&ctx.core, LevelKey::Bus(idx), name, false, ctx.ev_tx.clone()) {
+            Ok(t) => {
+                st.taps.insert(LevelKey::Bus(idx), t);
+                st.bus_tap_src.insert(idx, name.clone());
+            }
+            Err(e) => {
+                log::warn!("pre-fader tap for bus {idx} on {name} FAILED: {e}");
+                st.bus_tap_src.remove(&idx);
+            }
+        },
+        None => {
+            st.bus_tap_src.remove(&idx);
+        }
+    }
 }
 
 /// Faders and mutes act on the strip's own device node — never on the app or
@@ -901,26 +993,51 @@ fn reconcile(ctx: &Ctx) {
             st.desired.strip_input.iter().map(|(i, k)| (*i, k.clone())).collect();
         for (idx, key) in inputs {
             let Some(&(strip_node, _)) = st.strip_nodes.get(&idx) else { continue };
+            let srcs = resolve_source(&st.graph, &key);
             let dsp_target = st.dsp_nodes.get(&idx).and_then(|(i, o)| i.zip(*o));
             match dsp_target {
                 Some((dsp_in, dsp_out)) => {
                     // Tear down any direct source->strip link left over from
                     // before this strip's DSP module finished coming up.
-                    for src in resolve_source(&st.graph, &key) {
+                    for &src in &srcs {
                         remove_links_between(ctx, st, src, strip_node);
                     }
                     st.link_proxies.remove(&Slot::StripIn(idx));
-                    for src in resolve_source(&st.graph, &key) {
+                    for &src in &srcs {
                         ensure_links(&ctx.core, st, Slot::DspIn(idx), src, dsp_in);
                     }
                     ensure_links(&ctx.core, st, Slot::DspOut(idx), dsp_out, strip_node);
                 }
                 None => {
-                    for src in resolve_source(&st.graph, &key) {
+                    for &src in &srcs {
                         ensure_links(&ctx.core, st, Slot::StripIn(idx), src, strip_node);
                     }
                 }
             }
+            sync_prefader_tap(ctx, st, idx, srcs.first().copied());
+        }
+
+        // 1b. bus direct input: METERING ONLY, deliberately no routing link.
+        //     Unlike a strip (whose whole job is to carry its source's real
+        //     audio through the mix), a bus's direct input exists purely so
+        //     its meter can show that one source's level — actually LINKING
+        //     the source into the bus's sink (like step 1 does for strips)
+        //     would physically mix that audio into the bus, which is
+        //     catastrophic when the bus is also a SEND TO APP target for the
+        //     same app: e.g. Discord's own incoming voice would get routed
+        //     back into the bus Discord captures as its mic, so Discord's own
+        //     echo canceller suppresses the real mic signal it's tangled up
+        //     with. `sync_bus_prefader_tap` uses a separate, non-invasive
+        //     capture stream (a `tap::Tap`, same as strips' pre-fader tap)
+        //     that observes the source directly without touching the graph.
+        let bus_inputs: Vec<(usize, String)> =
+            st.desired.bus_input.iter().map(|(i, k)| (*i, k.clone())).collect();
+        for (idx, key) in bus_inputs {
+            if !st.bus_nodes.contains_key(&idx) {
+                continue;
+            }
+            let srcs = resolve_source(&st.graph, &key);
+            sync_bus_prefader_tap(ctx, st, idx, srcs.first().copied());
         }
 
         // 2. Point each app that belongs on a strip AT that strip's device,
@@ -1037,6 +1154,17 @@ fn reconcile(ctx: &Ctx) {
             ensure_links(&ctx.core, st, Slot::Monitor(b, a), src, dst);
         }
 
+        // 3c. Bus-to-bus feeds: a bus's output additionally routed into
+        //     another bus's input, alongside whatever strips send to it.
+        let fds: Vec<(usize, usize)> = st.feeds.iter().copied().collect();
+        for (from, to) in fds {
+            let (Some(&(src, _)), Some(&(dst, _))) = (st.bus_nodes.get(&from), st.bus_nodes.get(&to))
+            else {
+                continue;
+            };
+            ensure_links(&ctx.core, st, Slot::Feed(from, to), src, dst);
+        }
+
         // 4. A-bus -> hardware device
         let hw_buses: Vec<usize> = st
             .desired
@@ -1097,20 +1225,6 @@ fn remove_links_between(ctx: &Ctx, st: &mut WorkerState, out_node: NodeId, in_no
         st.graph.links.remove(&id);
         let _ = ctx.registry.destroy_global(id);
     }
-}
-
-/// Set a PipeWire default device via the "default" metadata object — the same
-/// mechanism `wpctl set-default` uses, so it persists like any manual change.
-fn set_default(ctx: &Ctx, key: &str, node_name: &str) -> bool {
-    let st = ctx.st.borrow();
-    let Some(md) = st.metadata.as_ref() else {
-        drop(st);
-        ctx.log("cannot set default: PipeWire metadata unavailable");
-        return false;
-    };
-    let json = format!("{{\"name\":\"{node_name}\"}}");
-    md.set_property(0, key, Some("Spa:String:JSON"), Some(&json));
-    true
 }
 
 fn find_hw_sink(st: &WorkerState, target: Option<&str>) -> Option<NodeId> {
@@ -1225,6 +1339,12 @@ fn remove_slot_links(ctx: &Ctx, slot: &Slot) {
                 _ => None,
             }
         }
+        Slot::Feed(from, to) => {
+            match (st.bus_nodes.get(from).map(|(id, _)| *id), st.bus_nodes.get(to).map(|(id, _)| *id)) {
+                (Some(s), Some(d)) => Some((vec![s], d)),
+                _ => None,
+            }
+        }
         Slot::BusListener(bus, cap) => {
             st.bus_nodes.get(bus).map(|(id, _)| *id).map(|bus_node| (vec![bus_node], *cap))
         }
@@ -1293,6 +1413,14 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                     }
                     None => {
                         st.desired.strip_input.remove(&idx);
+                        // Reconcile step 1 only re-evaluates the tap for
+                        // strips still present in `strip_input` — clearing
+                        // the key removes this strip from that loop entirely,
+                        // so the pre-fader tap must be torn down explicitly
+                        // here or it would keep showing the old source
+                        // forever instead of going silent.
+                        st.taps.remove(&LevelKey::Strip(idx));
+                        st.strip_tap_src.remove(&idx);
                     }
                 }
             }
@@ -1350,25 +1478,6 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             ctx.st.borrow_mut().feedback_guard = on;
             reconcile_all(ctx);
         }
-        PwCmd::SetDefaultOutput { idx } => {
-            let name = strip_name(idx);
-            let ok = set_default(ctx, "default.audio.sink", &name);
-            if ok {
-                let _ = ctx.ev_tx.send(BackendEvent::DefaultOutput(Some(idx)));
-                ctx.log(format!(
-                    "system default output → {} (apps that follow the default now land here)",
-                    m::strip_device_label(idx)
-                ));
-            }
-        }
-        PwCmd::SetDefaultInput { idx } => {
-            let name = virtual_dev::bus_node_name(idx);
-            let ok = set_default(ctx, "default.audio.source", &name);
-            if ok {
-                let _ = ctx.ev_tx.send(BackendEvent::DefaultInput(Some(idx)));
-                ctx.log(format!("system default input → bus {}", idx + 1));
-            }
-        }
         PwCmd::EnsureBus { idx, label, kind } => {
             ctx.st.borrow_mut().desired.buses.insert(idx, (label.clone(), kind));
             ensure_bus_device(ctx, idx, &label, kind);
@@ -1390,6 +1499,34 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                     for id in ids {
                         st.graph.links.remove(&id);
                         let _ = ctx.registry.destroy_global(id);
+                    }
+                }
+            }
+            reconcile_all(ctx);
+        }
+        PwCmd::SetBusInput { idx, source_key } => {
+            // Same no-op guard as SetStripInput, same reasoning.
+            if ctx.st.borrow().desired.bus_input.get(&idx) == source_key.as_ref() {
+                reconcile_all(ctx);
+                return;
+            }
+            // Metering-only (see the big comment in reconcile()'s step 1b):
+            // there's no routing link to tear down here, just the tap, which
+            // reconcile handles via `bus_tap_src` comparison / the explicit
+            // clear below.
+            {
+                let mut st = ctx.st.borrow_mut();
+                match source_key {
+                    Some(k) => {
+                        st.desired.bus_input.insert(idx, k);
+                    }
+                    None => {
+                        st.desired.bus_input.remove(&idx);
+                        // See the matching comment in SetStripInput: reconcile
+                        // step 1b only re-evaluates the tap for buses still
+                        // present in `bus_input`, so clear it explicitly here.
+                        st.taps.remove(&LevelKey::Bus(idx));
+                        st.bus_tap_src.remove(&idx);
                     }
                 }
             }
@@ -1438,6 +1575,20 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                 for a in mons {
                     remove_slot_links(ctx, &Slot::Monitor(idx, a));
                 }
+                // Same for bus-to-bus feeds this bus sends out (outgoing
+                // direction only — a bus that's fed BY this one has its own
+                // mute check independently; nothing extra needed here).
+                let feeds_out: Vec<usize> = ctx
+                    .st
+                    .borrow()
+                    .feeds
+                    .iter()
+                    .filter(|(from, _)| *from == idx)
+                    .map(|(_, to)| *to)
+                    .collect();
+                for to in feeds_out {
+                    remove_slot_links(ctx, &Slot::Feed(idx, to));
+                }
                 // A-bus (hardware output): drop its hardware-sink link too.
                 // This was missing entirely before — muting an A-bus never
                 // actually silenced it, since only listener/monitor links
@@ -1473,6 +1624,16 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             } else {
                 ctx.st.borrow_mut().monitors.remove(&(bus, a_bus));
                 remove_slot_links(ctx, &Slot::Monitor(bus, a_bus));
+                reconcile_all(ctx);
+            }
+        }
+        PwCmd::SetBusFeed { from, to, on } => {
+            if on {
+                ctx.st.borrow_mut().feeds.insert((from, to));
+                reconcile_all(ctx);
+            } else {
+                ctx.st.borrow_mut().feeds.remove(&(from, to));
+                remove_slot_links(ctx, &Slot::Feed(from, to));
                 reconcile_all(ctx);
             }
         }

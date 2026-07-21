@@ -2282,7 +2282,7 @@ dependencies = [
 
 [[package]]
 name = "mixer-core"
-version = "2.4.0"
+version = "2.6.0"
 dependencies = [
  "bincode",
  "dirs 5.0.1",
@@ -2293,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "mixer-daemon"
-version = "2.4.0"
+version = "2.6.0"
 dependencies = [
  "env_logger",
  "log",
@@ -2303,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "mixer-gui-iced"
-version = "2.4.0"
+version = "2.6.0"
 dependencies = [
  "env_logger",
  "iced",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "mixer-pw"
-version = "2.4.0"
+version = "2.6.0"
 dependencies = [
  "hound",
  "log",
