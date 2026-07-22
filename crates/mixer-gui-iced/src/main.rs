@@ -129,9 +129,45 @@ fn command_target(c: &Command) -> Option<RenameTarget> {
             mixer_core::model::RecTarget::Strip(s) => Some(RenameTarget::Strip(s)),
             mixer_core::model::RecTarget::Bus(b) => Some(RenameTarget::Bus(b)),
         },
-        SetRecordingsDir { .. } | SetUiScale { .. } | SetStripName { .. } | SetBusName { .. }
-        | SetFeedbackGuard { .. } | AddStrip | Save => None,
+        SetRecordingsDir { .. } | SetUiScale { .. } | SetSampleRate { .. } | SetStripName { .. } | SetBusName { .. }
+        | SetFeedbackGuard { .. } | AddStrip | RemoveLastStrip | Save => None,
     }
+}
+
+/// How many `card_w`-wide cards fit per row in `available` width, given
+/// `gap` between cards. `card_w + 20.0` matches `strip_card`/`bus_card`'s own
+/// outer container width (`width + 20.0`, their padding/border allowance) —
+/// see `widgets.rs`. Always at least 1: an oversized single card still gets
+/// its own row rather than the calculation returning 0 and losing cards.
+fn cards_per_row(available: f32, card_w: f32, gap: f32) -> usize {
+    let footprint = card_w + 20.0 + gap;
+    ((available / footprint).floor() as usize).max(1)
+}
+
+/// Arrange `cards` into a wrapping grid — as many per row as fit, additional
+/// cards flow onto new rows instead of overflowing the window or forcing
+/// `strip_card_width` to shrink cards past `STRIP_MIN`. This is what makes
+/// the console genuinely fit any window size/aspect ratio: the outer
+/// `scrollable` in `console()` is vertical, so extra rows just scroll,
+/// instead of the previous behavior of silently running wider than the
+/// window with no way to see the rest.
+fn wrap_cards<'a>(cards: Vec<Element<'a, Message>>, per_row: usize, gap: f32) -> Element<'a, Message> {
+    let mut rows = column![].spacing(gap);
+    let mut current = row![].spacing(gap);
+    let mut n = 0;
+    for card in cards {
+        current = current.push(card);
+        n += 1;
+        if n == per_row {
+            rows = rows.push(current);
+            current = row![].spacing(gap);
+            n = 0;
+        }
+    }
+    if n > 0 {
+        rows = rows.push(current);
+    }
+    rows.into()
 }
 
 #[derive(Debug, Clone)]
@@ -243,6 +279,24 @@ impl App {
                 if let Some(target) = command_target(&c) {
                     self.active = Some((target, Instant::now()));
                 }
+                // RemoveLastStrip always targets the current last index —
+                // if that strip happens to be mid-rename or the active-
+                // highlight target, both are keyed by index and that index
+                // won't exist anymore after removal, so clear them here
+                // rather than leaving stale state pointing at nothing (or
+                // worse, silently pointing at whatever strip now occupies
+                // a since-reused index in some future add).
+                if matches!(c, Command::RemoveLastStrip) {
+                    if let Some(state) = &self.state {
+                        let doomed = state.strips.len().saturating_sub(1);
+                        if matches!(self.renaming, Some((RenameTarget::Strip(i), _)) if i == doomed) {
+                            self.renaming = None;
+                        }
+                        if matches!(self.active, Some((RenameTarget::Strip(i), _)) if i == doomed) {
+                            self.active = None;
+                        }
+                    }
+                }
                 self.send(c);
             }
             Message::CopyLog => {
@@ -305,17 +359,22 @@ impl App {
     }
 
     /// Strip/bus card width for the current window: shrinks smoothly between
-    /// `STRIP_MAX` (roomy) and `STRIP_MIN` (compact) as the window narrows,
-    /// rather than clipping — below `STRIP_MIN` the console row scrolls
-    /// horizontally instead (see the `scrollable` wrapping it in `console()`).
+    /// `STRIP_MAX` (roomy) and `STRIP_MIN` (compact) as the window narrows.
+    /// Deliberately independent of how many strips/buses actually exist —
+    /// that used to be divided into this calculation directly, which meant
+    /// the row was sized for the strip count alone even though strips AND
+    /// buses shared the same row, silently running ~35% wider than the
+    /// window whenever buses were also present. Card count no longer needs
+    /// to factor in here at all: `console()` wraps any number of cards onto
+    /// as many rows as needed at whatever width this returns (see
+    /// `wrap_cards`), so sizing and card count are fully decoupled.
     fn strip_card_width(&self) -> f32 {
-        // Rough available width: window minus side padding/chrome. Doesn't
-        // need to be exact — it only picks a card size, the scrollable
-        // handles anything left over.
         let available = self.window_width - 80.0;
-        let strips = self.state.as_ref().map(|s| s.strips.len()).unwrap_or(5).max(1) as f32;
-        let per_card = available / strips - 20.0; // card padding/gap allowance
-        per_card.clamp(tokens::layout::STRIP_MIN, tokens::layout::STRIP_MAX)
+        // /7.0 is just "how many cards a comfortably-sized row should aim to
+        // hold before the window is considered wide" — not derived from
+        // anything exact, chosen so the default 1620px window lands near
+        // STRIP_MAX and the 960px minimum window lands near STRIP_MIN.
+        (available / 7.0 - 20.0).clamp(tokens::layout::STRIP_MIN, tokens::layout::STRIP_MAX)
     }
 
     fn view(&self) -> Element<Message> {
@@ -336,9 +395,9 @@ impl App {
 
     fn header(&self) -> Element<Message> {
         let logo = row![
-            text("FERRO").size(20).color(theme::TEXT),
-            text("MIX").size(20).color(theme::ACCENT),
-            text("2  v2.6").size(11).color(theme::TEXT_DIM),
+            text("FERRO").size(tokens::type_scale::DISPLAY).color(theme::TEXT),
+            text("MIX").size(tokens::type_scale::DISPLAY).color(theme::ACCENT),
+            text("2  v2.6").size(tokens::type_scale::BODY).color(theme::TEXT_DIM),
         ]
         .align_y(iced::Alignment::Center);
 
@@ -352,44 +411,58 @@ impl App {
 
         let status = if self.connected {
             row![
-                text("●").size(12).color(theme::METER_LO),
-                text(" LIVE").size(12).color(theme::TEXT),
+                icons::icon(icons::Icon::Dot, 10.0, theme::METER_LO),
+                Space::with_width(4),
+                text("LIVE").size(tokens::type_scale::SUBTITLE).color(theme::TEXT),
             ]
+            .align_y(iced::Alignment::Center)
         } else {
-            row![text("● ").size(12).color(theme::REC_RED), text(self.status.clone()).size(11).color(theme::TEXT_DIM)]
+            row![
+                icons::icon(icons::Icon::Dot, 10.0, theme::REC_RED),
+                Space::with_width(4),
+                text(self.status.clone()).size(tokens::type_scale::BODY).color(theme::TEXT_DIM),
+            ]
+            .align_y(iced::Alignment::Center)
         };
 
         let save_label = if self.dirty { "● SAVE" } else { "SAVED" };
         let save_fg = if self.dirty { theme::MIC_AMBER } else { theme::TEXT_DIM };
-        let save_btn = button(text(save_label).size(11).color(save_fg))
-            .style(move |_t, _s| iced::widget::button::Style {
-                background: Some(iced::Background::Color(if self.dirty {
+        let save_btn = button(text(save_label).size(tokens::type_scale::BODY).color(save_fg))
+            .style(move |_t, s| iced::widget::button::Style {
+                background: Some(iced::Background::Color(widgets::interactive(if self.dirty {
                     theme::MIC_AMBER.scale_alpha(0.12)
                 } else {
                     iced::Color::TRANSPARENT
-                })),
-                border: iced::Border { color: if self.dirty { theme::MIC_AMBER } else { theme::EDGE_SOFT }, width: 1.0, radius: 6.0.into() },
+                }, s))),
+                border: iced::Border { color: if self.dirty { theme::MIC_AMBER } else { theme::EDGE_SOFT }, width: 1.0, radius: tokens::radius::MD.into() },
                 text_color: save_fg,
                 ..Default::default()
             })
             .padding([6, 12])
             .on_press(Message::Send(Command::Save));
 
-        container(
-            row![
-                logo,
-                Space::with_width(24),
-                tabs,
-                Space::with_width(Length::Fill),
-                save_btn,
-                Space::with_width(16),
-                status,
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center),
-        )
-        .padding([12, 18])
-        .width(Length::Fill)
+        // A hairline under the bar (same `theme::divider` used between card
+        // sections) gives the header a defined edge as chrome, instead of
+        // blending straight into the console content below it.
+        column![
+            container(
+                row![
+                    logo,
+                    Space::with_width(24),
+                    tabs,
+                    Space::with_width(Length::Fill),
+                    save_btn,
+                    Space::with_width(16),
+                    status,
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding([12, 18])
+            .width(Length::Fill),
+            widgets::hr(),
+        ]
+        .spacing(0)
         .into()
     }
 
@@ -401,15 +474,19 @@ impl App {
                 .into();
         };
 
-        // Hardware-out row: A1/A2/A3 device slots across the top.
-        let mut hw = row![text("HARDWARE OUT").size(10).color(theme::TEXT_DIM)]
-            .spacing(10)
-            .align_y(iced::Alignment::Center);
+        // Hardware-out row: A1/A2/A3 device slots across the top. Label sits
+        // above (matching the INPUT STRIPS/VIRTUAL MICS label pattern below)
+        // and the slot row itself is centered in the available width instead
+        // of clumping left — on a wide window 2-3 fixed-width slots left no
+        // other cue that they weren't meant to fill the row.
+        let hw_label = text("HARDWARE OUT").size(tokens::type_scale::LABEL).color(theme::TEXT_DIM);
+        let mut hw_slots = row![].spacing(10);
         for (i, b) in state.buses.iter().enumerate() {
             if b.kind == BusKind::HwOutput {
-                hw = hw.push(widgets::hw_out_slot(i, b, state));
+                hw_slots = hw_slots.push(widgets::hw_out_slot(i, b, state));
             }
         }
+        let hw = container(hw_slots).width(Length::Fill).center_x(Length::Fill);
 
         let card_w = self.strip_card_width();
         let renaming_strip = |idx: usize| match &self.renaming {
@@ -423,55 +500,90 @@ impl App {
         let is_active_strip = |idx: usize| matches!(self.active, Some((RenameTarget::Strip(i), _)) if i == idx);
         let is_active_bus = |idx: usize| matches!(self.active, Some((RenameTarget::Bus(i), _)) if i == idx);
 
-        // Input strips (sources).
-        let mut strips = row![].spacing(10);
+        // Input strips (sources) — wrapped into as many rows as fit instead
+        // of one ever-shrinking row, so any number of strips fits any window
+        // width (see `wrap_cards`/`cards_per_row`'s doc comments for why).
+        let available = self.window_width - 80.0;
+        let per_row = cards_per_row(available, card_w, 10.0);
+        let mut strip_cards: Vec<Element<Message>> = Vec::new();
         for (i, s) in state.strips.iter().enumerate() {
-            strips = strips.push(widgets::strip_card(i, s, state, card_w, renaming_strip(i), is_active_strip(i)));
+            strip_cards.push(widgets::strip_card(i, s, state, card_w, renaming_strip(i), is_active_strip(i)));
         }
-        let add_strip = button(text("+").size(16).color(theme::TEXT_DIM).center().width(Length::Fill))
-            .style(|_t, _s| iced::widget::button::Style {
-                background: Some(iced::Background::Color(theme::CARD_LO)),
-                border: iced::Border { color: theme::EDGE_SOFT, width: 1.0, radius: 8.0.into() },
+        let strips_grid = wrap_cards(strip_cards, per_row, 10.0);
+
+        // Add/remove controls sit in their own compact row below the strip
+        // grid now, rather than tacked onto whichever row happened to be
+        // last — that pairing only made sense with a single un-wrapped row.
+        let add_strip = button(icons::icon(icons::Icon::Plus, 16.0, theme::TEXT_DIM))
+            .style(|_t, s| iced::widget::button::Style {
+                background: Some(iced::Background::Color(widgets::interactive(theme::CARD_LO, s))),
+                border: iced::Border { color: theme::EDGE_SOFT, width: 1.0, radius: tokens::radius::LG.into() },
                 text_color: theme::TEXT_DIM,
                 ..Default::default()
             })
-            .width(Length::Fixed(44.0))
-            .height(Length::Fixed(300.0))
+            .width(Length::Fixed(64.0))
+            .height(Length::Fixed(36.0))
             .on_press(Message::Send(Command::AddStrip));
-        strips = strips.push(add_strip);
+        // Mirrors "+" — always removes the LAST strip only (see
+        // `Command::RemoveLastStrip`'s doc comment for why never a specific
+        // one). Disabled (no `on_press`, dimmed) rather than hidden when
+        // only one strip remains, so the control stays in a stable place.
+        // Raw `.size(16)`, not a type-scale token: this is a large button
+        // glyph sized to match the "+" icon beside it, not body text — no
+        // minus-sign SVG exists in `icons.rs` so it stays Unicode.
+        let can_remove = state.strips.len() > 1;
+        let mut remove_strip = button(text("−").size(16).color(if can_remove { theme::TEXT_DIM } else { theme::EDGE_SOFT }).center().width(Length::Fill))
+            .style(move |_t, s| iced::widget::button::Style {
+                background: Some(iced::Background::Color(if can_remove { widgets::interactive(theme::CARD_LO, s) } else { theme::CARD_LO }.scale_alpha(if can_remove { 1.0 } else { 0.5 }))),
+                border: iced::Border { color: theme::EDGE_SOFT, width: 1.0, radius: tokens::radius::LG.into() },
+                text_color: theme::TEXT_DIM,
+                ..Default::default()
+            })
+            .width(Length::Fixed(64.0))
+            .height(Length::Fixed(36.0));
+        if can_remove {
+            remove_strip = remove_strip.on_press(Message::Send(Command::RemoveLastStrip));
+        }
+        let strip_controls = row![add_strip, Space::with_width(8), remove_strip];
 
-        // Virtual mic buses (B), on the right.
-        let mut buses = row![].spacing(10);
+        // Virtual mic buses (B) — same wrapping treatment, independent of
+        // the strip grid above (its own labeled group, its own row budget).
+        let mut bus_cards: Vec<Element<Message>> = Vec::new();
         for (i, b) in state.buses.iter().enumerate() {
             if b.kind == BusKind::VirtualMic {
-                buses = buses.push(widgets::bus_card(i, b, state, card_w, renaming_bus(i), is_active_bus(i)));
+                bus_cards.push(widgets::bus_card(i, b, state, card_w, renaming_bus(i), is_active_bus(i)));
             }
         }
+        let buses_grid = wrap_cards(bus_cards, per_row, 10.0);
 
-        let labels = row![
-            text("INPUT STRIPS").size(10).color(theme::TEXT_DIM),
-            Space::with_width(Length::Fill),
-            text("VIRTUAL MICS (apps select these as input)").size(10).color(theme::TEXT_DIM),
-        ];
+        let strip_label = text("INPUT STRIPS").size(tokens::type_scale::LABEL).color(theme::TEXT_DIM);
+        let bus_label = text("VIRTUAL MICS (apps select these as input)").size(tokens::type_scale::LABEL).color(theme::TEXT_DIM);
 
         let console = column![
+            hw_label,
+            Space::with_height(6),
             hw,
             Space::with_height(10),
             widgets::rec_panel(state),
             Space::with_height(14),
-            labels,
+            strip_label,
             Space::with_height(6),
-            row![strips, Space::with_width(20), buses].spacing(0),
+            strips_grid,
+            Space::with_height(8),
+            strip_controls,
+            Space::with_height(18),
+            bus_label,
+            Space::with_height(6),
+            buses_grid,
         ]
         .spacing(4)
         .padding(16);
 
-        // Horizontal scroll-on-overflow isn't viable here: several rows in
-        // this content (e.g. `labels`) intentionally use Length::Fill space
-        // to right-align a label, and Iced panics if scrollable content fills
-        // the axis it scrolls. Card-shrinking (`strip_card_width`) covers the
-        // common case instead; below STRIP_MIN, cards stay at STRIP_MIN and
-        // rely on window resize rather than a horizontal scrollbar.
+        // Only ever scrolls vertically — `wrap_cards` is what keeps this
+        // fitting horizontally at any window width now (extra cards become
+        // extra rows), so there's nothing left that needs a horizontal
+        // scrollbar (which Iced's `scrollable` can't mix with the
+        // `Length::Fill` used elsewhere in this content anyway).
         scrollable(console).width(Length::Fill).height(Length::Fill).into()
     }
 

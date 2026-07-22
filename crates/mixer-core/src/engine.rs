@@ -29,6 +29,17 @@ pub enum Command {
     SetBusInput { bus: usize, input: Option<String> },
     SetRecordingsDir { path: String },
     SetUiScale { scale: f32 },
+    /// Forces PipeWire's own graph clock to `rate` (44100/48000/96000) via
+    /// `pw-metadata -n settings 0 clock.force-rate` — system-wide, same as
+    /// every app currently running, not just FerroMix's own nodes. This is
+    /// the only way to actually stop an app whose native stream rate isn't
+    /// the graph's rate from being resampled before its audio ever reaches
+    /// FerroMix (see `virtual_dev.rs`'s `resample.quality` pinning for the
+    /// complementary fix inside FerroMix's own node chain). Disruptive in
+    /// the same way `ResetAudio` (the GUI's "RESET AUDIO TO STOCK PIPEWIRE"
+    /// button) is — streams may briefly glitch/reconnect while the graph
+    /// renegotiates — that's expected, not a bug to engineer around.
+    SetSampleRate { rate: u32 },
     SetStripName { strip: usize, name: String },
     SetBusName { bus: usize, name: String },
     ToggleBusMonitor { bus: usize, a_bus: usize },
@@ -48,6 +59,15 @@ pub enum Command {
     StopRecordTarget { target: RecTarget },
     SetFeedbackGuard { on: bool },
     AddStrip,
+    /// Removes the LAST strip only — never a specific index. A strip's
+    /// index is baked into its real PipeWire node name/description, its DSP
+    /// module's node names, and saved `BusCfg.strip_feeds` entries, so
+    /// removing from the middle and reindexing everything after it would
+    /// mean destroying and recreating every later strip's actual PipeWire
+    /// node and re-pointing anything routed to them. Mirroring `AddStrip`'s
+    /// append-only symmetry avoids all of that. Refused (no-op) if only one
+    /// strip remains.
+    RemoveLastStrip,
     Save,
 }
 
@@ -183,8 +203,26 @@ fn initial_state(cfg: &Config) -> MixerState {
         recordings_dir: cfg.recordings_dir().display().to_string(),
         feedback_guard: cfg.feedback_guard,
         ui_scale: cfg.ui_scale,
+        sample_rate: cfg.sample_rate,
         log: Vec::new(),
     }
+}
+
+/// Write `clock.allowed-rates` (widened to every rate the Settings picker
+/// offers, so switching between them never needs this again) and
+/// `clock.force-rate` to PipeWire's "settings" metadata object — the two
+/// writes `Command::SetSampleRate`'s handler needs, factored out so both the
+/// live command handler and daemon startup (below) can re-assert a
+/// persisted non-default rate without duplicating the exact `pw-metadata`
+/// invocations. See `Command::SetSampleRate`'s doc comment for why this
+/// shells out rather than going through `AudioBackend`.
+fn apply_sample_rate_metadata(rate: u32) {
+    let _ = std::process::Command::new("pw-metadata")
+        .args(["-n", "settings", "0", "clock.allowed-rates", "[ 44100, 48000, 96000 ]"])
+        .output();
+    let _ = std::process::Command::new("pw-metadata")
+        .args(["-n", "settings", "0", "clock.force-rate", &rate.to_string()])
+        .output();
 }
 
 fn ts() -> String {
@@ -270,6 +308,21 @@ fn run(
     {
         let st = state.lock().unwrap();
         let _ = backend.set_feedback_guard(config.feedback_guard);
+        // Must land before any ensure_strip/ensure_bus below — those create
+        // the actual adapter nodes, which are pinned to whatever rate is
+        // current at creation time (see `AudioBackend::set_sample_rate`).
+        let _ = backend.set_sample_rate(config.sample_rate);
+        // PipeWire's own `clock.force-rate`/`clock.allowed-rates` metadata
+        // is NOT itself persisted across a PipeWire restart (confirmed
+        // live) — only FerroMix's own `config.toml` remembers the user's
+        // choice. Re-assert it here so a persisted non-default rate from a
+        // previous session doesn't silently revert to pipewire.conf's stock
+        // 48000 default the next time the system boots or PipeWire restarts
+        // without FerroMix having been the one to trigger it. A no-op write
+        // when `sample_rate` is already 48000 (the default).
+        if config.sample_rate != 48_000 {
+            apply_sample_rate_metadata(config.sample_rate);
+        }
         // Each strip is a virtual sink device apps can point their output at.
         for (i, _s) in st.strips.iter().enumerate() {
             let _ = backend.ensure_strip(i, &model::strip_device_label(i));
@@ -659,6 +712,44 @@ fn run(
                     st.ui_scale = config.ui_scale;
                     let _ = config.save();
                 }
+                Command::SetSampleRate { rate } => {
+                    // Only the three rates the Settings picker offers — a
+                    // stray/typo'd value falling back to 48000 (the system's
+                    // current default) is safer than forcing an arbitrary
+                    // rate PipeWire might refuse outright.
+                    let rate = match rate { 44_100 | 48_000 | 96_000 => rate, _ => 48_000 };
+                    config.sample_rate = rate;
+                    st.sample_rate = rate;
+                    let _ = config.save();
+                    let _ = backend.set_sample_rate(rate);
+                    st.push_log(format!("{} sample rate → {rate} Hz (restarting PipeWire to apply)", ts()));
+                    // Confirmed live (this session): setting clock.force-rate
+                    // alone is NOT enough to actually switch the running
+                    // rate — PipeWire keeps the existing rate if the ALSA
+                    // driver node is already active, and the setting itself
+                    // isn't picked up cleanly without the graph restarting.
+                    // Same class of disruptive action as the GUI's "RESET
+                    // AUDIO TO STOCK PIPEWIRE" button (restarts the same
+                    // three units), which is why this restarts PipeWire too
+                    // rather than trying to hot-swap the rate on a live
+                    // graph — then re-applies the metadata shortly after
+                    // (spawned on a separate thread so this command handler
+                    // doesn't block the engine's command loop for the
+                    // ~1.5s the restart needs to settle) so the FRESH graph
+                    // comes up already forced to the new rate instead of
+                    // silently reverting to pipewire.conf's stock default.
+                    apply_sample_rate_metadata(rate);
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "restart", "pipewire.socket", "pipewire-pulse.socket"])
+                        .spawn();
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["--user", "restart", "wireplumber.service"])
+                        .spawn();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(1500));
+                        apply_sample_rate_metadata(rate);
+                    });
+                }
                 Command::SetFeedbackGuard { on } => {
                     config.feedback_guard = on;
                     st.feedback_guard = on;
@@ -667,9 +758,29 @@ fn run(
                 }
                 Command::AddStrip => {
                     let n = st.buses.len();
-                    st.strips.push(Strip::empty(n));
-                    let count = st.strips.len();
-                    st.push_log(format!("{} added strip {:02}", ts(), count));
+                    let new_idx = st.strips.len();
+                    let strip = Strip::empty(n);
+                    // Previously GUI-state-only: grew `st.strips` but never
+                    // told the backend, so a strip added mid-session had no
+                    // real PipeWire node until the next restart (config
+                    // reload picked up the new count). `ensure_strip` +
+                    // `push_strip` mirror exactly what the startup loop does
+                    // for every config-loaded strip — same calls, just for
+                    // one strip, live.
+                    let _ = backend.ensure_strip(new_idx, &model::strip_device_label(new_idx));
+                    push_strip(backend, new_idx, &strip);
+                    st.strips.push(strip);
+                    st.push_log(format!("{} added strip {:02}", ts(), new_idx + 1));
+                }
+                Command::RemoveLastStrip => {
+                    if st.strips.len() <= 1 {
+                        st.push_log(format!("{} refused: can't remove the last remaining strip", ts()));
+                    } else {
+                        let idx = st.strips.len() - 1;
+                        st.strips.pop();
+                        let _ = backend.remove_strip(idx);
+                        st.push_log(format!("{} removed strip {:02}", ts(), idx + 1));
+                    }
                 }
                 Command::Save => {
                     config.strip_count = st.strips.len();

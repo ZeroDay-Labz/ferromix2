@@ -300,6 +300,10 @@ pub struct MixerState {
     /// UI scale factor. 0.0 = auto (follow the monitor's DPI), else applied
     /// directly as the window's scale factor.
     pub ui_scale: f32,
+    /// The PipeWire graph's forced clock rate — see `Config.sample_rate`'s
+    /// doc comment. Mirrored here so the Settings picker can show which rate
+    /// is currently active.
+    pub sample_rate: u32,
     pub log: Vec<String>,
 }
 

@@ -3,6 +3,7 @@
 //! legible: A (hardware) reads cyan, B (virtual mic) reads violet, danger reads
 //! coral, and everything else stays quiet.
 
+use crate::tokens;
 use iced::{Background, Border, Color, Font, Shadow, Vector};
 
 /// The bundled UI typeface (see `assets/fonts/`, embedded in `main.rs`).
@@ -63,7 +64,7 @@ fn card_shadow() -> Shadow {
 pub fn card(_t: &iced::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(Background::Color(CARD)),
-        border: Border { color: EDGE_SOFT, width: 1.0, radius: 8.0.into() },
+        border: Border { color: EDGE_SOFT, width: 1.0, radius: tokens::radius::LG.into() },
         shadow: card_shadow(),
         text_color: Some(TEXT),
     }
@@ -78,9 +79,19 @@ pub fn card_accent(accent: Color, active: bool) -> impl Fn(&iced::Theme) -> iced
     let (edge_color, edge_width) = if active { (MIC_AMBER, 2.0) } else { (accent.scale_alpha(0.45), 1.0) };
     move |_t| iced::widget::container::Style {
         background: Some(Background::Color(CARD)),
-        border: Border { color: edge_color, width: edge_width, radius: 8.0.into() },
+        border: Border { color: edge_color, width: edge_width, radius: tokens::radius::LG.into() },
         shadow: card_shadow(),
         text_color: Some(TEXT),
+    }
+}
+
+/// A hairline divider — used inside cards to separate ROUTING/SEND/DSP
+/// sections with a visible seam instead of blank space alone, and under the
+/// header to give the chrome bar a defined edge against the console below.
+pub fn divider(_t: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(Background::Color(EDGE_SOFT.scale_alpha(0.6))),
+        ..Default::default()
     }
 }
 

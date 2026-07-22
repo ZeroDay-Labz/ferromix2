@@ -76,6 +76,14 @@ pub struct Config {
     /// 1.5–2.0 for 4K. Saved so the window comes back the size you left it.
     #[serde(default)]
     pub ui_scale: f32,
+    /// The PipeWire graph's forced clock rate (`clock.force-rate`), applied
+    /// system-wide, and the rate every FerroMix adapter node is created at
+    /// (`virtual_dev.rs`'s `create_sink`/`create_virtual_source`). 44100,
+    /// 48000, or 96000 — see `Command::SetSampleRate`'s doc comment for why
+    /// this reaches outside FerroMix's own graph rather than staying purely
+    /// per-node.
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: u32,
     #[serde(default)]
     pub buses: Vec<BusCfg>,
     #[serde(default, rename = "strip")]
@@ -100,6 +108,9 @@ fn default_hw() -> String {
 fn default_strip_count() -> usize {
     5
 }
+fn default_sample_rate() -> u32 {
+    48_000
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -109,6 +120,7 @@ impl Default for Config {
             recordings_dir: None,
             strip_count: 5,
             ui_scale: 0.0, // auto
+            sample_rate: 48_000,
             buses: vec![
                 BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), strip_feeds: Vec::new(), input: None, listener: None, label: "A1".into(), kind: "hw".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
                 BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), strip_feeds: Vec::new(), input: None, listener: None, label: "A2".into(), kind: "hw".into(), device: None, volume: crate::model::UNITY_POS, mute: false },

@@ -31,6 +31,12 @@ pub trait AudioBackend: Send {
     /// Everything a strip does (fader, mute, meter, sends) happens on this node.
     fn ensure_strip(&mut self, idx: usize, label: &str) -> BackendResult;
 
+    /// Tear down strip `idx` entirely — its PipeWire node, tap, DSP module
+    /// (if loaded), and every link referencing it. Only ever called for the
+    /// LAST strip index (see `Command::RemoveLastStrip`'s doc comment for
+    /// why) — never assume any strip after `idx` needs updating.
+    fn remove_strip(&mut self, idx: usize) -> BackendResult;
+
     /// Link a source (a mic, or an app that's playing) INTO strip `idx`.
     /// `None` clears it — the strip still works for apps pointed at its device.
     fn set_strip_input(&mut self, idx: usize, source_key: Option<String>) -> BackendResult;
@@ -56,6 +62,13 @@ pub trait AudioBackend: Send {
     fn set_bus_mute(&mut self, bus_idx: usize, mute: bool) -> BackendResult;
 
     fn set_feedback_guard(&mut self, on: bool) -> BackendResult;
+
+    /// The rate every newly-created strip/bus adapter node is pinned to —
+    /// see `Command::SetSampleRate`'s doc comment. Only affects nodes
+    /// created AFTER this call; existing nodes keep whatever rate they were
+    /// created with (adapter rate is a creation-time property, not a live
+    /// one), so a rate change takes full effect after a daemon restart.
+    fn set_sample_rate(&mut self, rate: u32) -> BackendResult;
 
     /// Send a bus into a hardware out, so you can monitor what the far end hears.
     fn set_bus_monitor(&mut self, bus_idx: usize, a_bus_idx: usize, on: bool) -> BackendResult;

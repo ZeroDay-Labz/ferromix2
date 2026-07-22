@@ -25,6 +25,7 @@ use std::sync::mpsc::Receiver;
 #[derive(Debug)]
 pub(crate) enum PwCmd {
     EnsureStrip { idx: usize, label: String },
+    RemoveStrip { idx: usize },
     SetStripInput { idx: usize, source_key: Option<String> },
     SetStripVolume { idx: usize, volume: f32 },
     SetStripMute { idx: usize, mute: bool },
@@ -32,6 +33,7 @@ pub(crate) enum PwCmd {
     SetStripDsp { idx: usize, dsp: StripDsp },
     SetStripForceMono { idx: usize, on: bool },
     SetFeedbackGuard { on: bool },
+    SetSampleRate { rate: u32 },
     EnsureBus { idx: usize, label: String, kind: BusKind },
     SetBusDevice { idx: usize, device: Option<String> },
     SetBusVolume { idx: usize, volume: f32 },
@@ -75,6 +77,9 @@ impl AudioBackend for PwBackend {
     fn ensure_strip(&mut self, idx: usize, label: &str) -> BackendResult {
         self.send(PwCmd::EnsureStrip { idx, label: label.to_string() })
     }
+    fn remove_strip(&mut self, idx: usize) -> BackendResult {
+        self.send(PwCmd::RemoveStrip { idx })
+    }
     fn set_strip_input(&mut self, idx: usize, source_key: Option<String>) -> BackendResult {
         self.send(PwCmd::SetStripInput { idx, source_key })
     }
@@ -95,6 +100,9 @@ impl AudioBackend for PwBackend {
     }
     fn set_feedback_guard(&mut self, on: bool) -> BackendResult {
         self.send(PwCmd::SetFeedbackGuard { on })
+    }
+    fn set_sample_rate(&mut self, rate: u32) -> BackendResult {
+        self.send(PwCmd::SetSampleRate { rate })
     }
     fn ensure_bus(&mut self, idx: usize, label: &str, kind: BusKind) -> BackendResult {
         self.send(PwCmd::EnsureBus { idx, label: label.to_string(), kind })

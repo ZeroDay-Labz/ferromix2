@@ -23,8 +23,12 @@ pub fn bus_node_name(idx: usize) -> String {
 }
 
 /// Create a virtual sink (strip / hardware bus). Returns the proxy, which we
-/// keep alive in the worker state.
-pub fn create_sink(core: &pw::core::CoreRc, name: &str, desc: &str) -> Result<pw::node::Node, String> {
+/// keep alive in the worker state. `rate` should match whatever the graph's
+/// clock is currently forced to (`Config.sample_rate` /
+/// `Command::SetSampleRate`, default 48000) — see the `audio.rate` comment
+/// below for why this matters.
+pub fn create_sink(core: &pw::core::CoreRc, name: &str, desc: &str, rate: u32) -> Result<pw::node::Node, String> {
+    let rate_s = rate.to_string();
     let props = properties! {
         "factory.name" => "support.null-audio-sink",
         "node.name" => name,
@@ -34,6 +38,18 @@ pub fn create_sink(core: &pw::core::CoreRc, name: &str, desc: &str) -> Result<pw
         // monitor follows the sink's channelVolumes → our fader affects routing
         "monitor.channel-volumes" => "true",
         "node.virtual" => "true",
+        // Pin an exact rate and a high-quality resampler instead of leaving
+        // both at PipeWire's defaults (~4/14 quality). A typical signal path
+        // chains 2-4 of these adapter nodes back to back (source -> strip ->
+        // [DSP] -> bus -> hw); each one is an independent resample/format
+        // point, and default-quality resampling compounded across that many
+        // hops is a known source of audible smearing ("underwater"/phasey
+        // sound) even when every hop individually sounds fine in isolation.
+        // Mismatching this against the graph's actual forced rate would
+        // reintroduce exactly that problem, so it must track the live
+        // setting rather than staying a hardcoded 48000.
+        "audio.rate" => rate_s.as_str(),
+        "resample.quality" => "10",
     };
     core.create_object::<pw::node::Node>("adapter", &props)
         .map_err(|e| format!("create sink {name}: {e}"))
@@ -54,7 +70,9 @@ pub fn create_virtual_source(
     core: &pw::core::CoreRc,
     name: &str,
     desc: &str,
+    rate: u32,
 ) -> Result<pw::node::Node, String> {
+    let rate_s = rate.to_string();
     let props = properties! {
         "factory.name" => "support.null-audio-sink",
         "node.name" => name,
@@ -72,6 +90,9 @@ pub fn create_virtual_source(
         "monitor.passthrough" => "false",
         "channelmix.normalize" => "false",
         "node.virtual" => "true",
+        // See create_sink's comment — same cumulative-resample-quality fix.
+        "audio.rate" => rate_s.as_str(),
+        "resample.quality" => "10",
     };
     core.create_object::<pw::node::Node>("adapter", &props)
         .map_err(|e| format!("create virtual source {name}: {e}"))

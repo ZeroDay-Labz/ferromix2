@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 /// Every strip is a virtual sink device named `ferromix.strip.N`, described to
 /// the system as "FerroMix Input N+1". Apps can point their output straight at
@@ -94,6 +95,13 @@ struct Desired {
     bus_mute: HashMap<usize, bool>,
     /// bus -> the source key directly linked into it (mirrors `strip_input`).
     bus_input: HashMap<usize, String>,
+    /// The rate every newly-created strip/bus adapter node is pinned to
+    /// (`virtual_dev.rs`'s `create_sink`/`create_virtual_source`) — set via
+    /// `PwCmd::SetSampleRate`, mirrors `Config.sample_rate`. Defaulted to
+    /// 48000 explicitly in `run()` (not by this struct's `#[derive(Default)]`
+    /// alone, which would zero it) since 0 isn't a valid rate to hand the
+    /// adapter factory.
+    sample_rate: u32,
 }
 
 #[derive(Default)]
@@ -114,6 +122,28 @@ struct WorkerState {
     stream_targets: HashMap<NodeId, String>,
     /// Initial registry enumeration finished (safe to create devices).
     synced: bool,
+    /// Set by registry-event handlers (`on_global`/`on_global_remove`)
+    /// instead of calling `reconcile_all` (and every other per-event
+    /// adopt/emit pass) directly. A periodic timer (armed in `run()`) checks
+    /// this and, at most once per tick, runs the full adopt/emit/reconcile
+    /// pass — coalescing a burst of registry events (e.g. WirePlumber/
+    /// pipewire-pulse reacting to a released app, or the ~5 node/~15 port/
+    /// ~10 link churn a single DSP module reload produces) into one pass
+    /// instead of firing synchronously, once per event, with zero
+    /// throttling. That storm was the confirmed root cause of Discord/
+    /// Spotify sometimes crashing when reassigned OR when a strip's
+    /// gate/comp was toggled: the app's stream (or the DSP module's nodes)
+    /// got unlinked/relinked/re-enumerated several times in a very short
+    /// window as FerroMix and WirePlumber's own routing fought over it.
+    /// Everything gated behind this flag (`adopt_buses`, `adopt_strips`,
+    /// `apply_strip_controls`, `emit_inventory`, `emit_capture_apps`,
+    /// `emit_listeners`, `reconcile_all`) is idempotent, so running the
+    /// whole set on every tick where anything changed — rather than trying
+    /// to track which specific one(s) a given event actually requires — is
+    /// deliberately simple and cheap at 15ms granularity. Command handlers
+    /// (`handle_cmd`) are unaffected — those are already user-paced (one
+    /// click, one settle) and still call these directly.
+    dirty: bool,
     /// Commands parked until the initial sync completes.
     parked: Vec<PwCmd>,
     creating: HashSet<String>,
@@ -162,6 +192,19 @@ struct WorkerState {
     /// tap at all — its meter is silent, never falling back to the bus's own
     /// (mixed/routed) node. See `sync_bus_prefader_tap`.
     bus_tap_src: HashMap<usize, String>,
+    /// (app node, stray destination) -> when we first saw that pairing this
+    /// reconcile pass. The redirect step only actually cuts a stray link
+    /// once it's persisted past a short grace window (see the redirect
+    /// site's comment) instead of on the very first sighting — confirmed
+    /// live that some clients (Spotify, going through pipewire-pulse) have
+    /// WirePlumber/pipewire-pulse's own policy continuously RECREATE a link
+    /// to the system default sink many times a second even with
+    /// `target.object` correctly set, and cutting it the instant it appears
+    /// only fuels that fight (WirePlumber sees its link vanish and
+    /// immediately retries) rather than breaking it. Entries not present in
+    /// the current pass's stray set are pruned every pass so this can't grow
+    /// unbounded or misfire against a pairing that's no longer stray.
+    stray_dest_first_seen: HashMap<(NodeId, NodeId), Instant>,
 }
 
 #[derive(Clone)]
@@ -195,7 +238,11 @@ pub(crate) fn run(cmd_rx: pw::channel::Receiver<PwCmd>, ev_tx: Sender<BackendEve
         context,
         registry: registry.clone(),
         ev_tx: ev_tx.clone(),
-        st: Rc::new(RefCell::new(WorkerState { feedback_guard: true, ..Default::default() })),
+        st: Rc::new(RefCell::new(WorkerState {
+            feedback_guard: true,
+            desired: Desired { sample_rate: 48_000, ..Default::default() },
+            ..Default::default()
+        })),
     };
 
     let _rl = registry
@@ -225,6 +272,45 @@ pub(crate) fn run(cmd_rx: pw::channel::Receiver<PwCmd>, ev_tx: Sender<BackendEve
     });
 
     // Mark the end of the initial registry dump with a core sync roundtrip.
+    // Coalescing timer for registry-event-triggered reconciles — see
+    // `WorkerState.dirty`'s doc comment. Always-on periodic poll rather than
+    // an arm-per-event timer: the latter would need a `TimerSource<'l>`
+    // (borrows `Loop` with a lifetime) reachable from `on_global`/
+    // `on_global_remove`, which would force a lifetime parameter through
+    // `WorkerState`/`Ctx` end to end. A cheap 15ms poll of a bool avoids
+    // that entirely — `_reconcile_timer` just needs to stay alive for the
+    // duration of `run()`, which it does (bound in this same scope, and
+    // `run()` doesn't return until `mainloop.run()` does, i.e. process exit).
+    let _reconcile_timer = {
+        let ctx = ctx.clone();
+        let timer = mainloop.loop_().add_timer(move |_expirations| {
+            let pending = {
+                let mut st = ctx.st.borrow_mut();
+                std::mem::take(&mut st.dirty)
+            };
+            if pending {
+                // All of these used to run synchronously, once per raw
+                // registry event, in on_global/on_global_remove — which meant
+                // a dense event burst (a DSP module reload creates/destroys
+                // ~5 nodes/~15 ports/~10 links, far more than the single
+                // relink case the original debounce targeted) still drove
+                // dozens of full adopt/emit passes even after reconcile_all
+                // itself was coalesced. Folding them into the same
+                // dirty-flag tick coalesces the whole per-event workload,
+                // not just reconcile, into at most one pass per 15ms.
+                adopt_buses(&ctx);
+                adopt_strips(&ctx);
+                apply_strip_controls(&ctx);
+                emit_inventory(&ctx);
+                emit_capture_apps(&ctx);
+                emit_listeners(&ctx);
+                reconcile_all(&ctx);
+            }
+        });
+        timer.update_timer(Some(Duration::from_millis(15)), Some(Duration::from_millis(15)));
+        timer
+    };
+
     let _core_listener = ctx
         .core
         .add_listener_local()
@@ -290,13 +376,9 @@ fn on_global(ctx: &Ctx, g: &pw::registry::GlobalObject<&pw::spa::utils::dict::Di
                     ctx.st.borrow_mut().bound.insert(node.id, bound);
                 }
             }
-            ctx.st.borrow_mut().graph.nodes.insert(node.id, node);
-            adopt_buses(ctx);
-            adopt_strips(ctx);
-            apply_strip_controls(ctx);
-            emit_inventory(ctx);
-            emit_capture_apps(ctx);
-            reconcile_all(ctx);
+            let mut st = ctx.st.borrow_mut();
+            st.graph.nodes.insert(node.id, node);
+            st.dirty = true;
         }
         pw::types::ObjectType::Metadata => {
             let name = g.props.and_then(|p| p.get("metadata.name")).unwrap_or("");
@@ -313,16 +395,17 @@ fn on_global(ctx: &Ctx, g: &pw::registry::GlobalObject<&pw::spa::utils::dict::Di
         pw::types::ObjectType::Port => {
             let Some(props) = g.props else { return };
             if let Some(port) = registry::parse_port(g.id, props) {
-                ctx.st.borrow_mut().graph.ports.insert(port.id, port);
-                reconcile_all(ctx);
+                let mut st = ctx.st.borrow_mut();
+                st.graph.ports.insert(port.id, port);
+                st.dirty = true;
             }
         }
         pw::types::ObjectType::Link => {
             let Some(props) = g.props else { return };
             if let Some(link) = registry::parse_link(g.id, props) {
-                ctx.st.borrow_mut().graph.links.insert(link.id, link);
-                reconcile_all(ctx);
-                emit_listeners(ctx);
+                let mut st = ctx.st.borrow_mut();
+                st.graph.links.insert(link.id, link);
+                st.dirty = true;
             }
         }
         _ => {}
@@ -342,10 +425,25 @@ fn on_global_remove(ctx: &Ctx, id: u32) {
                 // out from under us (e.g. module crashed), forget the id so
                 // reconcile falls back to the direct source->strip path
                 // instead of trying to link into a dead node.
+                //
+                // NodeId-verified: only clear if the id being removed is the
+                // one we actually have recorded. Add/remove events for
+                // `ferromix.dsp.{idx}.in/out` are matched by NAME, not id —
+                // that name is identical across every reload generation of a
+                // strip's DSP module (see `dsp.rs`'s naming), so a STALE
+                // remove event for an already-superseded old generation
+                // (e.g. arriving late after two GATE/COMP reloads landed
+                // close together) would otherwise unconditionally clobber a
+                // freshly-recorded live generation's entry back to `None` —
+                // producing either doubled/phasing audio (reconcile falls
+                // back to the direct link while the real DSP link is still
+                // live) or a gate/comp that's silently stuck non-functional.
                 if let Some(entry) = st.dsp_nodes.get_mut(&idx) {
                     if is_in {
-                        entry.0 = None;
-                    } else {
+                        if entry.0 == Some(id) {
+                            entry.0 = None;
+                        }
+                    } else if entry.1 == Some(id) {
                         entry.1 = None;
                     }
                 }
@@ -364,9 +462,8 @@ fn on_global_remove(ctx: &Ctx, id: u32) {
         }
         st.graph.ports.remove(&id);
         st.graph.links.remove(&id);
+        st.dirty = true;
     }
-    emit_inventory(ctx);
-    reconcile_all(ctx);
 }
 
 /// Create/adopt bus null-sinks for every desired bus.
@@ -481,8 +578,9 @@ fn ensure_strip_device(ctx: &Ctx, idx: usize) {
             return;
         }
     }
+    let rate = ctx.st.borrow().desired.sample_rate;
     ctx.st.borrow_mut().creating.insert(name.clone());
-    match virtual_dev::create_sink(&ctx.core, &name, &m::strip_device_label(idx)) {
+    match virtual_dev::create_sink(&ctx.core, &name, &m::strip_device_label(idx), rate) {
         Ok(node) => ctx.st.borrow_mut().keepalive.push(node),
         Err(e) => {
             ctx.st.borrow_mut().creating.remove(&name);
@@ -510,11 +608,12 @@ fn ensure_bus_device(ctx: &Ctx, idx: usize, label: &str, kind: BusKind) {
         return;
     }
     let name = virtual_dev::bus_node_name(idx);
+    let rate = ctx.st.borrow().desired.sample_rate;
     ctx.st.borrow_mut().creating.insert(name.clone());
     let desc = format!("FerroMix {label}");
     let created = match kind {
-        BusKind::HwOutput => virtual_dev::create_sink(&ctx.core, &name, &desc),
-        BusKind::VirtualMic => virtual_dev::create_virtual_source(&ctx.core, &name, &desc),
+        BusKind::HwOutput => virtual_dev::create_sink(&ctx.core, &name, &desc, rate),
+        BusKind::VirtualMic => virtual_dev::create_virtual_source(&ctx.core, &name, &desc, rate),
     };
     match created {
         Ok(node) => {
@@ -536,10 +635,8 @@ fn resolve_source(graph: &Graph, key: &str) -> Vec<NodeId> {
         .nodes
         .values()
         .filter(|n| {
-            matches!(n.kind(), NodeKind::AppPlayback | NodeKind::HwSource) && {
-                let k = n.source_key();
-                k == key_l || k.contains(&key_l)
-            }
+            matches!(n.kind(), NodeKind::AppPlayback | NodeKind::HwSource)
+                && n.source_keys().iter().any(|k| *k == key_l || k.contains(&key_l))
         })
         .map(|n| n.id)
         .collect()
@@ -626,12 +723,15 @@ fn resolve_capture(graph: &Graph, key: &str) -> Vec<NodeId> {
         .values()
         .filter(|n| {
             n.kind() == NodeKind::AppCapture && {
-                let k = n.source_key();
-                // Same substring fallback as resolve_source: a bus_listener key
-                // recorded before an app's exact stream name settles (or that
-                // drifts slightly across relaunches) would otherwise silently
-                // match nothing, leaving the B-bus listener link never drawn.
-                k == key_l || k.contains(&key_l)
+                // Match against every candidate identity (binary/app_name/node
+                // name), not just the single preferred key: a bus_listener key
+                // recorded before an app's exact stream identity settles (or
+                // that drifts slightly across relaunches — confirmed live for
+                // a Python/ALSA-plugin-routed SIP softphone whose
+                // application.process.binary isn't always present at
+                // registration) would otherwise silently match nothing,
+                // leaving the listener link never drawn.
+                n.source_keys().iter().any(|k| *k == key_l || k.contains(&key_l))
             }
         })
         .map(|n| n.id)
@@ -1225,14 +1325,37 @@ fn reconcile(ctx: &Ctx) {
         // exclusive, but catches a stray link that reappears later without
         // the node itself disappearing, which the old one-shot-only version
         // could never see again once `stream_targets` already matched.
+        //
+        // Grace period before actually cutting: confirmed live (Spotify,
+        // via pipewire-pulse) that a stray link to the system default sink
+        // can get RECREATED by WirePlumber/pipewire-pulse's own policy many
+        // times a second — cutting it the instant it's seen just means we
+        // race that policy's own retry, which retries immediately, which we
+        // cut immediately, forever (`object.linger=true` and `state: init`
+        // on the offending link, confirmed via pw-dump, are the signature of
+        // that fight — a link that never gets the chance to either activate
+        // or be abandoned before we tear it down). Only cutting a pairing
+        // that's persisted for a short window breaks that loop for the
+        // common repeated-storm case while still catching a genuinely
+        // sticky stray link (the original bug this mechanism exists for)
+        // well within the time a user would ever notice.
         let mut legit_by_src: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
         for &(node, strip_node, _) in &targets {
             legit_by_src.entry(node).or_default().push(strip_node);
         }
-        for (node, keep) in legit_by_src {
-            for other in stray_destinations(&st.graph, node, &keep) {
+        let mut current_stray: HashSet<(NodeId, NodeId)> = HashSet::new();
+        for (node, keep) in &legit_by_src {
+            for other in stray_destinations(&st.graph, *node, keep) {
+                current_stray.insert((*node, other));
+            }
+        }
+        st.stray_dest_first_seen.retain(|k, _| current_stray.contains(k));
+        for key @ (node, other) in current_stray {
+            let first = *st.stray_dest_first_seen.entry(key).or_insert_with(Instant::now);
+            if first.elapsed() >= Duration::from_millis(250) {
                 log::info!("REDIRECT {} off {} (now exclusively on FerroMix)", nname(st, node), nname(st, other));
                 remove_links_between(ctx, st, node, other);
+                st.stray_dest_first_seen.remove(&key);
             }
         }
 
@@ -1556,6 +1679,108 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             ensure_strip_device(ctx, idx);
             reconcile_all(ctx);
         }
+        PwCmd::RemoveStrip { idx } => {
+            // Only ever called for the LAST strip index (see
+            // `Command::RemoveLastStrip`'s doc comment) — nothing after
+            // `idx` exists, so no reindexing/remapping is needed anywhere
+            // below, just a full teardown of everything referencing `idx`.
+
+            // Release any app pointed at this strip's INPUT, same as
+            // SetStripInput{None}'s release block.
+            {
+                let mut st = ctx.st.borrow_mut();
+                if let Some(old) = st.desired.strip_input.get(&idx).cloned() {
+                    let nodes = resolve_source(&st.graph, &old);
+                    for n in nodes {
+                        if st.stream_targets.remove(&n).is_some() {
+                            if let Some(md) = st.metadata.as_ref() {
+                                md.set_property(n, "target.object", None, None);
+                            }
+                        }
+                    }
+                }
+            }
+            // Same for an app pointed at this strip as its LISTENER (SEND TO
+            // APP), mirroring SetStripListener's release block.
+            {
+                let mut st = ctx.st.borrow_mut();
+                if let Some(old) = st.strip_listener.remove(&idx) {
+                    let nodes = resolve_capture(&st.graph, &old);
+                    for n in nodes {
+                        if st.capture_targets.remove(&n).is_some() {
+                            if let Some(md) = st.metadata.as_ref() {
+                                md.set_property(n, "target.object", None, None);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Tear down every link this strip participates in.
+            remove_slot_links(ctx, &Slot::StripIn(idx));
+            remove_slot_links(ctx, &Slot::DspIn(idx));
+            remove_slot_links(ctx, &Slot::DspOut(idx));
+            let sends: Vec<usize> = ctx
+                .st
+                .borrow()
+                .desired
+                .assigns
+                .iter()
+                .filter(|(s, _)| *s == idx)
+                .map(|(_, b)| *b)
+                .collect();
+            for b in sends {
+                remove_slot_links(ctx, &Slot::Send(idx, b));
+            }
+            let feeds_in: Vec<usize> = ctx
+                .st
+                .borrow()
+                .bus_strip_feeds
+                .iter()
+                .filter(|(_, s)| *s == idx)
+                .map(|(b, _)| *b)
+                .collect();
+            for b in feeds_in {
+                remove_slot_links(ctx, &Slot::BusToStrip(b, idx));
+            }
+            let listener_caps: Vec<NodeId> = ctx
+                .st
+                .borrow()
+                .strip_listener_links
+                .keys()
+                .filter(|(s, _)| *s == idx)
+                .map(|(_, cap)| *cap)
+                .collect();
+            for cap in listener_caps {
+                remove_slot_links(ctx, &Slot::StripListener(idx, cap));
+            }
+
+            // Forget every piece of desired/tracked state keyed by `idx`,
+            // drop its DSP module (its `Drop` impl destroys the filter-chain
+            // module cleanly), and destroy its own PipeWire node.
+            let mut st = ctx.st.borrow_mut();
+            st.desired.strips.remove(&idx);
+            st.desired.strip_input.remove(&idx);
+            st.desired.strip_vol.remove(&idx);
+            st.desired.strip_mute.remove(&idx);
+            st.desired.strip_force_mono.remove(&idx);
+            st.desired.assigns.retain(|(s, _)| *s != idx);
+            st.bus_strip_feeds.retain(|(_, s)| *s != idx);
+            st.strip_listener_links.retain(|&(s, _), _| s != idx);
+            st.taps.remove(&LevelKey::Strip(idx));
+            st.strip_tap_src.remove(&idx);
+            st.dsp_modules.remove(&idx);
+            st.dsp_nodes.remove(&idx);
+            st.recorders.remove(&RecTarget::Strip(idx));
+            if let Some((id, _)) = st.strip_nodes.remove(&idx) {
+                st.graph.nodes.remove(&id);
+                drop(st);
+                let _ = ctx.registry.destroy_global(id);
+            } else {
+                drop(st);
+            }
+            reconcile_all(ctx);
+        }
         PwCmd::SetStripInput { idx, source_key } => {
             // No-op if nothing actually changed. The engine re-pushes strip
             // inputs whenever the app list moves, and blindly relinking caused
@@ -1623,21 +1848,32 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             }
         }
         PwCmd::SetStripDsp { idx, dsp } => {
-            // Always (re)load: a fresh module with the new control values
-            // baked into its SPA-JSON args. Replacing the HashMap entry drops
-            // (and so destroys, via DspModule's Drop) whatever module was
-            // there before — see dsp.rs's docstring for why this reloads
-            // instead of pushing live param updates into the running chain.
+            // Tear down the OLD module (if any) and its slot links BEFORE
+            // loading the new one — previously the new module was loaded
+            // first and the old one only got dropped as a side effect of
+            // replacing the HashMap entry, so for a brief window both
+            // instances' node/port/link churn was in flight in the registry
+            // at once (on top of a single reload already being a denser
+            // burst — ~5 nodes/~15 ports/~10 links — than an ordinary
+            // relink). Explicitly dropping `dsp_modules[idx]` first destroys
+            // the old module synchronously (`DspModule::drop` ->
+            // `pw_impl_module_destroy`) before the new one is even
+            // requested, and explicitly clearing `Slot::DspIn`/`DspOut`'s
+            // link_proxies (mirroring `SetStripForceMono`'s
+            // teardown-before-flip pattern) means we don't rely solely on
+            // `ensure_links_with_pairs`'s lazy retain to prune the old
+            // generation's stale proxy entries once the new generation's
+            // port ids appear.
+            remove_slot_links(ctx, &Slot::DspIn(idx));
+            remove_slot_links(ctx, &Slot::DspOut(idx));
+            {
+                let mut st = ctx.st.borrow_mut();
+                st.dsp_modules.remove(&idx);
+                st.dsp_nodes.remove(&idx);
+            }
             match dsp::load_filter_chain(&ctx.context, idx, &dsp) {
                 Ok(module) => {
-                    let mut st = ctx.st.borrow_mut();
-                    st.dsp_modules.insert(idx, module);
-                    // The old dsp.in/out node ids (if any) just got destroyed
-                    // along with the old module — forget them so reconcile
-                    // falls back to the direct source->strip path until the
-                    // new module's nodes show up in the registry.
-                    st.dsp_nodes.remove(&idx);
-                    drop(st);
+                    ctx.st.borrow_mut().dsp_modules.insert(idx, module);
                     ctx.log(format!(
                         "DSP strip {} — gate {} / comp {}",
                         idx + 1,
@@ -1662,6 +1898,15 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
         PwCmd::SetFeedbackGuard { on } => {
             ctx.st.borrow_mut().feedback_guard = on;
             reconcile_all(ctx);
+        }
+        PwCmd::SetSampleRate { rate } => {
+            // Only affects nodes created AFTER this point — see the
+            // `AudioBackend::set_sample_rate` doc comment for why existing
+            // nodes can't pick this up live. No reconcile needed: nothing
+            // about desired links/routing changed, just what future
+            // `create_sink`/`create_virtual_source` calls will request.
+            ctx.st.borrow_mut().desired.sample_rate = rate;
+            ctx.log(format!("sample rate set to {rate} Hz for future strip/bus nodes"));
         }
         PwCmd::EnsureBus { idx, label, kind } => {
             ctx.st.borrow_mut().desired.buses.insert(idx, (label.clone(), kind));

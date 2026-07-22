@@ -232,6 +232,13 @@ impl AudioBackend for MockBackend {
         let _ = self.tx.send(BackendEvent::Log(format!("strip device ready: {label}")));
         Ok(())
     }
+    fn remove_strip(&mut self, idx: usize) -> BackendResult {
+        let mut sh = self.shared.lock().unwrap();
+        sh.n_strips = sh.n_strips.saturating_sub(1);
+        sh.strip_input.remove(&idx);
+        sh.strip_faders.remove(&idx);
+        Ok(())
+    }
     fn set_strip_input(&mut self, idx: usize, source_key: Option<String>) -> BackendResult {
         let mut sh = self.shared.lock().unwrap();
         match source_key {
@@ -299,6 +306,9 @@ impl AudioBackend for MockBackend {
     }
     fn set_feedback_guard(&mut self, on: bool) -> BackendResult {
         self.shared.lock().unwrap().guard = on;
+        Ok(())
+    }
+    fn set_sample_rate(&mut self, _rate: u32) -> BackendResult {
         Ok(())
     }
     fn set_bus_monitor(&mut self, _bus_idx: usize, _a_bus_idx: usize, _on: bool) -> BackendResult {

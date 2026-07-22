@@ -73,6 +73,39 @@ impl PwNode {
         n.to_lowercase()
     }
 
+    /// Every identity string this node could plausibly have been keyed by,
+    /// lowercased: binary, app name, node name. `source_key()` picks ONE
+    /// (binary-preferred) at whatever moment a node is first seen — but for
+    /// some clients (confirmed live with a Python/ALSA-plugin-routed SIP
+    /// softphone) `application.process.binary` isn't reliably present at
+    /// registration time across every stream instance, so a strip's stored
+    /// key (captured from an earlier instance where binary WAS present) can
+    /// stop substring-matching a later instance whose preferred key changed.
+    /// Matching against every candidate instead of just the preferred one
+    /// makes `resolve_source`/`resolve_capture` resilient to that — as long
+    /// as ANY one field (e.g. app_name) stayed stable across instances, the
+    /// match still succeeds.
+    pub fn source_keys(&self) -> Vec<String> {
+        let mut keys = Vec::with_capacity(3);
+        if let Some(bin) = self.binary.as_deref() {
+            let b = bin.trim().to_lowercase();
+            if !b.is_empty() {
+                keys.push(b);
+            }
+        }
+        if let Some(app) = self.app_name.as_deref() {
+            let a = app.trim().to_lowercase();
+            if !a.is_empty() && !keys.contains(&a) {
+                keys.push(a);
+            }
+        }
+        let n = self.name.to_lowercase();
+        if !keys.contains(&n) {
+            keys.push(n);
+        }
+        keys
+    }
+
     /// Human label. For apps we title-case the binary ("discord" → "Discord")
     /// because application.name is often junk ("WEBRTC VoiceEngine").
     pub fn label(&self) -> String {
