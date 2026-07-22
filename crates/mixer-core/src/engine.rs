@@ -17,6 +17,8 @@ pub enum Command {
     SetStripVolume { strip: usize, volume: f32 },
     SetStripMute { strip: usize, mute: bool },
     SetStripDsp { strip: usize, dsp: crate::model::StripDsp },
+    /// See `Strip.force_mono`'s doc comment.
+    SetStripForceMono { strip: usize, on: bool },
     SetBusVolume { bus: usize, volume: f32 },
     SetBusMute { bus: usize, mute: bool },
     SetBusDevice { bus: usize, device: Option<String> },
@@ -164,6 +166,7 @@ fn initial_state(cfg: &Config) -> MixerState {
                 dsp: crate::model::StripDsp::default(),
                 listener: s.listener.clone(),
                 listeners: Vec::new(),
+                force_mono: s.force_mono,
             }
         })
         .collect();
@@ -197,6 +200,9 @@ fn push_strip(backend: &mut dyn AudioBackend, idx: usize, strip: &Strip) {
     }
     let _ = backend.set_strip_volume(idx, strip.volume);
     let _ = backend.set_strip_mute(idx, strip.mute);
+    if strip.force_mono {
+        let _ = backend.set_strip_force_mono(idx, true);
+    }
 }
 
 /// Resolve a chosen input key against the live input list.
@@ -463,6 +469,12 @@ fn run(
                     }
                     let _ = backend.set_strip_dsp(strip, dsp);
                 }
+                Command::SetStripForceMono { strip, on } => {
+                    if let Some(s) = st.strips.get_mut(strip) {
+                        s.force_mono = on;
+                    }
+                    let _ = backend.set_strip_force_mono(strip, on);
+                }
                 Command::SetStripMute { strip, mute } => {
                     if let Some(s) = st.strips.get_mut(strip) {
                         s.mute = mute;
@@ -707,6 +719,7 @@ fn run(
                         mute: s.mute,
                         assign: s.assign.iter().enumerate().filter(|(_, on)| **on)
                             .filter_map(|(bi, _)| st.buses.get(bi).map(|b| b.label.clone())).collect(),
+                        force_mono: s.force_mono,
                     }).collect();
                     match config.save() {
                         Ok(()) => st.push_log(format!("{} config saved", ts())),

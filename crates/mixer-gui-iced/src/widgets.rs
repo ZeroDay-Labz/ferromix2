@@ -18,14 +18,15 @@ pub fn tab_button(label: &str, active: bool) -> button::Button<'_, Message> {
     let fg = if active { theme::ACCENT } else { theme::TEXT_DIM };
     button(text(label).size(12).color(fg))
         .style(move |_t, _s| button::Style {
-            background: Some(iced::Background::Color(if active { theme::with_alpha(theme::ACCENT, 0.12) } else { Color::TRANSPARENT })),
+            background: Some(iced::Background::Color(if active { theme::ACCENT.scale_alpha(0.12) } else { Color::TRANSPARENT })),
             border: Border { color: if active { theme::ACCENT } else { theme::EDGE_SOFT }, width: 1.0, radius: 6.0.into() },
             text_color: fg, ..Default::default()
         })
         .padding([6, 14])
 }
 
-fn send_pill<'a>(label: &'a str, on: bool, fb: bool, is_b: bool, msg: Message) -> Element<'a, Message> {
+fn send_pill<'a>(label: impl Into<String>, on: bool, fb: bool, is_b: bool, msg: Message) -> Element<'a, Message> {
+    let label = label.into();
     let accent = if is_b { theme::VIOLET } else { theme::ACCENT };
     let (bg, fg, edge) = if fb { (theme::DANGER, theme::BG_DEEP, theme::DANGER) }
         else if on { (accent, theme::BG_DEEP, accent) }
@@ -50,7 +51,7 @@ fn rename_head<'a>(name: String, renaming: Option<&'a str>, target: RenameTarget
                 icon: theme::TEXT_DIM,
                 placeholder: theme::TEXT_DIM,
                 value: theme::TEXT,
-                selection: theme::with_alpha(accent, 0.35),
+                selection: accent.scale_alpha(0.35),
             })
             .into()
     } else {
@@ -181,7 +182,7 @@ impl<F: Fn(f32) -> Message> canvas::Program<Message> for FaderCap<F> {
         if fill_h > 0.5 {
             f.fill(
                 &Path::rectangle(Point::new(rail_x, handle_y), Size::new(rail_w, fill_h)),
-                theme::with_alpha(self.accent, 0.85),
+                self.accent.scale_alpha(0.85),
             );
         }
 
@@ -198,7 +199,7 @@ impl<F: Fn(f32) -> Message> canvas::Program<Message> for FaderCap<F> {
         f.stroke(&handle_rect, Stroke::default().with_color(self.accent).with_width(1.5));
         f.fill(
             &Path::rectangle(Point::new(cx - handle_w / 2.0 + 3.0, handle_top + 3.0), Size::new(handle_w - 6.0, 2.5)),
-            theme::with_alpha(theme::TEXT, 0.3),
+            theme::TEXT.scale_alpha(0.3),
         );
 
         vec![f.into_geometry()]
@@ -225,7 +226,7 @@ fn knob<'a>(label: &'a str, value: f32, on: bool, accent: Color, strip: usize, d
         .height(Length::Fixed(48.0));
     let toggle = { let ndsp = if is_gate { StripDsp { gate_on: !dsp.gate_on, ..dsp } } else { StripDsp { comp_on: !dsp.comp_on, ..dsp } }; Message::Send(Command::SetStripDsp { strip, dsp: ndsp }) };
     let lbl = button(text(label).size(9).color(if on { accent } else { theme::TEXT_DIM }).center().width(Length::Fill))
-        .style(move |_t, _s| button::Style { background: Some(iced::Background::Color(if on { theme::with_alpha(accent, 0.15) } else { theme::SEG_OFF })), border: Border { color: if on { accent } else { theme::EDGE }, width: 1.0, radius: 4.0.into() }, text_color: if on { accent } else { theme::TEXT_DIM }, ..Default::default() })
+        .style(move |_t, _s| button::Style { background: Some(iced::Background::Color(if on { accent.scale_alpha(0.15) } else { theme::SEG_OFF })), border: Border { color: if on { accent } else { theme::EDGE }, width: 1.0, radius: 4.0.into() }, text_color: if on { accent } else { theme::TEXT_DIM }, ..Default::default() })
         .width(Length::Fixed(48.0)).padding([2, 0]).on_press(toggle);
     column![dial, lbl].spacing(3).align_x(Alignment::Center).into()
 }
@@ -242,20 +243,26 @@ impl Dial {
     }
 }
 
+/// (anchor_y_at_press, anchor_value_at_press) for the drag-distance math (see
+/// the big comment on `update()`), plus `live` — the value the knob is
+/// CURRENTLY showing while a drag is in progress, updated on every
+/// `CursorMoved` for a smooth-looking drag, but deliberately NOT sent to the
+/// backend until release. `Command::SetStripDsp` triggers a full PipeWire
+/// filter-chain module destroy+reload (see `dsp.rs`) — genuinely disruptive,
+/// audibly cutting that strip for a moment. Emitting it on every mouse-move
+/// sample during a drag (tens of times a second) turned a single knob drag
+/// into a rapid-fire storm of real module teardown/rebuild cycles, which is
+/// what "touching the GUI kills all audio" traced back to. Committing once,
+/// on release, keeps the knob visually responsive (via `live`) without ever
+/// re-loading the module more than once per gesture.
+#[derive(Default, Clone, Copy)]
+struct DialState {
+    drag: Option<(f32, f32)>,
+    live: Option<f32>,
+}
+
 impl canvas::Program<Message> for Dial {
-    // (anchor_y_at_press, value_at_press) — BOTH fixed for the whole drag
-    // gesture, never re-slid. `self.value` only refreshes when a fresh
-    // MixerState arrives from the ~30Hz async daemon poll, which is stale for
-    // the duration of a fast drag; a version of this that re-anchored on
-    // every CursorMoved (and added the per-event delta to the still-stale
-    // `self.value`) made a real 100px drag collapse to whatever the last
-    // couple of mouse-move samples produced — the knob felt unresponsive to
-    // dragging even though every command it did send was well-formed and
-    // reached a verified-working backend. Snapshotting both values at press
-    // time and computing everything relative to that snapshot (never to
-    // `self.value` again mid-gesture) makes the result depend only on total
-    // cursor travel since press, immune to how stale `self.value` gets.
-    type State = Option<(f32, f32)>;
+    type State = DialState;
 
     fn update(&self, state: &mut Self::State, event: canvas::Event, bounds: Rectangle, cursor: iced::mouse::Cursor) -> (canvas::event::Status, Option<Message>) {
         use canvas::event::{self, Event};
@@ -263,21 +270,28 @@ impl canvas::Program<Message> for Dial {
         let inside = cursor.is_over(bounds);
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(Button::Left)) if inside => {
-                *state = cursor.position().map(|p| (p.y, self.value));
+                state.drag = cursor.position().map(|p| (p.y, self.value));
+                state.live = Some(self.value);
                 (event::Status::Captured, None)
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                if let (Some((anchor_y, anchor_value)), Some(pos)) = (*state, cursor.position()) {
+                if let (Some((anchor_y, anchor_value)), Some(pos)) = (state.drag, cursor.position()) {
                     // Drag up = increase. 120px of travel = full range,
                     // measured from the press point, not the last event.
                     let delta = (anchor_y - pos.y) / 120.0;
-                    return (event::Status::Captured, Some(self.emit(anchor_value + delta)));
+                    state.live = Some((anchor_value + delta).clamp(0.0, 1.0));
+                    // No message here — see DialState's doc comment. The
+                    // ~60Hz UI redraw tick already picks up `state.live` on
+                    // the next frame, so the knob still tracks the cursor
+                    // smoothly; only the expensive backend commit waits.
+                    return (event::Status::Captured, None);
                 }
                 (event::Status::Ignored, None)
             }
             Event::Mouse(mouse::Event::ButtonReleased(Button::Left)) => {
-                *state = None;
-                (event::Status::Ignored, None)
+                let msg = state.live.take().map(|nv| self.emit(nv));
+                state.drag = None;
+                (event::Status::Captured, msg)
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if inside => {
                 let dy = match delta { mouse::ScrollDelta::Lines { y, .. } => y, mouse::ScrollDelta::Pixels { y, .. } => y / 40.0 };
@@ -291,13 +305,14 @@ impl canvas::Program<Message> for Dial {
         }
     }
 
-    fn draw(&self, _s: &Self::State, r: &Renderer, _t: &Theme, b: Rectangle, _c: iced::mouse::Cursor) -> Vec<Geometry> {
+    fn draw(&self, s: &Self::State, r: &Renderer, _t: &Theme, b: Rectangle, _c: iced::mouse::Cursor) -> Vec<Geometry> {
         use std::f32::consts::PI;
         let mut f = Frame::new(r, b.size());
         let c = Point::new(b.width / 2.0, b.height / 2.0);
         let rad = b.width / 2.0 - 6.0;
         let start = PI * 0.75;
         let sweep = PI * 1.5;
+        let display_value = s.live.unwrap_or(self.value);
 
         // Tick marks around the dial.
         for i in 0..=10 {
@@ -305,12 +320,12 @@ impl canvas::Program<Message> for Dial {
             let (i0, i1) = (rad + 1.0, rad + 4.0);
             f.stroke(
                 &Path::line(Point::new(c.x + i0 * a.cos(), c.y + i0 * a.sin()), Point::new(c.x + i1 * a.cos(), c.y + i1 * a.sin())),
-                Stroke::default().with_color(theme::with_alpha(theme::EDGE, 0.8)).with_width(1.0),
+                Stroke::default().with_color(theme::EDGE.scale_alpha(0.8)).with_width(1.0),
             );
         }
 
         // Track.
-        let dim = theme::with_alpha(self.accent, if self.on { 0.22 } else { 0.10 });
+        let dim = self.accent.scale_alpha(if self.on { 0.22 } else { 0.10 });
         f.stroke(
             &Path::new(|p| { p.arc(canvas::path::Arc { center: c, radius: rad, start_angle: iced::Radians(start), end_angle: iced::Radians(start + sweep) }); }),
             Stroke::default().with_color(dim).with_width(5.0),
@@ -323,25 +338,25 @@ impl canvas::Program<Message> for Dial {
         // inert: nothing moved on screen until the user separately toggled
         // the knob on, so a real drag gesture appeared to do nothing twice
         // over.
-        let v = self.value.clamp(0.0, 1.0);
+        let v = display_value.clamp(0.0, 1.0);
         let (glow_a, bright_a) = if self.on { (0.35, 1.0) } else { (0.15, 0.35) };
         // Glow underlay.
         f.stroke(
             &Path::new(|p| { p.arc(canvas::path::Arc { center: c, radius: rad, start_angle: iced::Radians(start), end_angle: iced::Radians(start + sweep * v) }); }),
-            Stroke::default().with_color(theme::with_alpha(self.accent, glow_a)).with_width(9.0),
+            Stroke::default().with_color(self.accent.scale_alpha(glow_a)).with_width(9.0),
         );
         // Value arc.
         f.stroke(
             &Path::new(|p| { p.arc(canvas::path::Arc { center: c, radius: rad, start_angle: iced::Radians(start), end_angle: iced::Radians(start + sweep * v) }); }),
-            Stroke::default().with_color(theme::with_alpha(self.accent, bright_a)).with_width(5.0),
+            Stroke::default().with_color(self.accent.scale_alpha(bright_a)).with_width(5.0),
         );
         // Pointer dot.
         let ang = start + sweep * v;
-        f.fill(&Path::circle(Point::new(c.x + rad * ang.cos(), c.y + rad * ang.sin()), 3.5), theme::with_alpha(theme::TEXT, if self.on { 1.0 } else { 0.5 }));
+        f.fill(&Path::circle(Point::new(c.x + rad * ang.cos(), c.y + rad * ang.sin()), 3.5), theme::TEXT.scale_alpha(if self.on { 1.0 } else { 0.5 }));
 
         // Hub with a subtle bevel.
         f.fill(&Path::circle(c, rad * 0.5), theme::PANEL_HI);
-        f.stroke(&Path::circle(c, rad * 0.5), Stroke::default().with_color(theme::with_alpha(self.accent, if self.on { 0.5 } else { 0.2 })).with_width(1.0));
+        f.stroke(&Path::circle(c, rad * 0.5), Stroke::default().with_color(self.accent.scale_alpha(if self.on { 0.5 } else { 0.2 })).with_width(1.0));
         vec![f.into_geometry()]
     }
 }
@@ -376,7 +391,7 @@ impl Meter {
                 if i as i32 == peak_i {
                     f.fill(
                         &Path::rounded_rectangle(Point::new(x, i as f32 * sh - 1.0), Size::new(w, sh + 2.0), 2.5.into()),
-                        theme::with_alpha(col, 0.35),
+                        col.scale_alpha(0.35),
                     );
                 }
                 f.fill(&seg, col);
@@ -384,7 +399,7 @@ impl Meter {
         }
         f.stroke(
             &Path::rounded_rectangle(Point::new(x, 0.0), Size::new(w, height), 3.0.into()),
-            Stroke::default().with_color(theme::with_alpha(accent, 0.4)).with_width(1.0),
+            Stroke::default().with_color(accent.scale_alpha(0.4)).with_width(1.0),
         );
     }
 }
@@ -468,7 +483,12 @@ pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState, width
     let knobs = row![knob("GATE", dsp.gate, dsp.gate_on, theme::ACCENT, idx, dsp, true), Space::with_width(6), knob("COMP", dsp.comp, dsp.comp_on, theme::VIOLET, idx, dsp, false)];
     let mute = wide_button("MUTE", strip.mute, theme::REC_RED, Message::Send(Command::SetStripMute { strip: idx, mute: !strip.mute }));
     let rec = rec_button(strip.recording, RecTarget::Strip(idx));
-    let body = column![head, Space::with_height(5), input_dd, Space::with_height(4), listener_dd, Space::with_height(3), listening, echo_warn, Space::with_height(6), fader_row, Space::with_height(8), column![a_row, b_row].spacing(3), Space::with_height(8), knobs, Space::with_height(8), row![mute, Space::with_width(4), rec].spacing(0)]
+    // Fixes a source that presents real stereo ports but only ever writes
+    // audio into one of them (e.g. a SIP phone call heard in one ear only)
+    // — see `Strip.force_mono`'s doc comment for why this can't be
+    // auto-detected and needs an explicit switch.
+    let mono_btn = wide_button("MONO", strip.force_mono, theme::MIC_AMBER, Message::Send(Command::SetStripForceMono { strip: idx, on: !strip.force_mono }));
+    let body = column![head, Space::with_height(5), input_dd, Space::with_height(4), listener_dd, Space::with_height(3), listening, echo_warn, Space::with_height(6), fader_row, Space::with_height(8), column![a_row, b_row].spacing(3), Space::with_height(8), knobs, Space::with_height(8), row![mute, Space::with_width(4), mono_btn, Space::with_width(4), rec].spacing(0)]
         .spacing(0).width(Length::Fixed(width));
     container(body).padding(10).width(Length::Fixed(width + 20.0)).style(theme::card_accent(if strip.input_live { accent } else { theme::EDGE_SOFT }, active)).into()
 }
@@ -536,9 +556,17 @@ pub fn bus_card<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState, width: f32,
         let on = bus.feeds.get(oi).copied().unwrap_or(false);
         feed = feed.push(send_pill(&ob.label, on, false, true, Message::Send(Command::ToggleBusFeed { from: idx, to: oi })));
     }
+    // Bus-to-strip: this bus's output additionally feeding one or more
+    // strips (the reverse of a strip's own send-to-bus pills) — e.g. B1 as a
+    // shared "everything" channel feeding back into the input strips.
+    let mut to_strips = row![].spacing(3);
+    for si in 0..state.strips.len() {
+        let on = bus.strip_feeds.get(si).copied().unwrap_or(false);
+        to_strips = to_strips.push(send_pill(format!("S{}", si + 1), on, false, true, Message::Send(Command::ToggleBusStripFeed { bus: idx, strip: si })));
+    }
     let mute = wide_button("MUTE", bus.mute, theme::REC_RED, Message::Send(Command::SetBusMute { bus: idx, mute: !bus.mute }));
     let rec = rec_button(bus.recording, RecTarget::Bus(idx));
-    let body = column![head, Space::with_height(5), input_dd, Space::with_height(4), app_dd, Space::with_height(3), listening, dup_note, Space::with_height(6), fader_row, Space::with_height(8), text("MONITOR ON").size(8).color(theme::TEXT_DIM), Space::with_height(2), mon, Space::with_height(6), text("FEED →").size(8).color(theme::TEXT_DIM), Space::with_height(2), feed, Space::with_height(8), row![mute, Space::with_width(4), rec].spacing(0)]
+    let body = column![head, Space::with_height(5), input_dd, Space::with_height(4), app_dd, Space::with_height(3), listening, dup_note, Space::with_height(6), fader_row, Space::with_height(8), text("MONITOR ON").size(8).color(theme::TEXT_DIM), Space::with_height(2), mon, Space::with_height(6), text("FEED →").size(8).color(theme::TEXT_DIM), Space::with_height(2), feed, Space::with_height(6), text("FEED → STRIPS").size(8).color(theme::TEXT_DIM), Space::with_height(2), to_strips, Space::with_height(8), row![mute, Space::with_width(4), rec].spacing(0)]
         .spacing(0).width(Length::Fixed(width));
     container(body).padding(10).width(Length::Fixed(width + 20.0)).style(theme::card_accent(accent, active)).into()
 }
@@ -608,16 +636,27 @@ pub fn rec_panel<'a>(state: &'a MixerState) -> Element<'a, Message> {
 pub fn matrix_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
     let mut grid = column![].spacing(6);
 
-    // Header row: bus labels.
+    // Header row: bus labels, each with its own REC toggle right in the grid
+    // — the matrix already shows every bus at a glance, so recording control
+    // belongs here too instead of only on the strip/bus cards.
     let mut header = row![container(text("").width(Length::Fixed(150.0))).width(Length::Fixed(150.0))].spacing(6);
-    for bus in &state.buses {
+    for (bi, bus) in state.buses.iter().enumerate() {
         let col = if bus.kind == BusKind::VirtualMic { theme::VIOLET } else { theme::ACCENT };
         let tag = if bus.kind == BusKind::VirtualMic { "MIC" } else { "OUT" };
         header = header.push(
-            container(column![text(&bus.label).size(12).color(col), text(tag).size(7).color(theme::TEXT_DIM)].align_x(Alignment::Center))
-                .width(Length::Fixed(54.0)).center_x(Length::Fixed(54.0)),
+            container(
+                column![
+                    text(&bus.label).size(12).color(col),
+                    text(tag).size(7).color(theme::TEXT_DIM),
+                    Space::with_height(3),
+                    mini_rec_chip("", col, bus.recording, RecTarget::Bus(bi)),
+                ]
+                .align_x(Alignment::Center),
+            )
+            .width(Length::Fixed(54.0)).center_x(Length::Fixed(54.0)),
         );
     }
+    header = header.push(container(text("REC").size(9).color(theme::TEXT_DIM)).width(Length::Fixed(54.0)).center_x(Length::Fixed(54.0)));
     grid = grid.push(header);
 
     for (si, strip) in state.strips.iter().enumerate() {
@@ -645,6 +684,10 @@ pub fn matrix_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
                 .on_press(Message::Send(Command::ToggleAssign { strip: si, bus: bi }));
             r = r.push(cell);
         }
+        r = r.push(
+            container(mini_rec_chip("", theme::TEXT_DIM, strip.recording, RecTarget::Strip(si)))
+                .width(Length::Fixed(54.0)).center_x(Length::Fixed(54.0)),
+        );
         grid = grid.push(r);
     }
 
@@ -700,7 +743,7 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
             icon: theme::TEXT_DIM,
             placeholder: theme::TEXT_DIM,
             value: theme::TEXT,
-            selection: theme::with_alpha(theme::ACCENT, 0.35),
+            selection: theme::ACCENT.scale_alpha(0.35),
         })
         .width(Length::Fill);
     let apply_btn = button(text("APPLY").size(9).color(theme::BG_DEEP).center())

@@ -55,6 +55,9 @@ pub struct StripCfg {
     /// Bus labels this strip feeds, e.g. ["A1", "B1"].
     #[serde(default)]
     pub assign: Vec<String>,
+    /// Same meaning as `Strip.force_mono`.
+    #[serde(default)]
+    pub force_mono: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,7 +123,7 @@ impl Default for Config {
             // Strips start as bare devices routed to A1: point an app's output
             // at "FerroMix Input N" and you hear it immediately.
             strips: (0..5)
-                .map(|_| StripCfg { name: String::new(), input: None, listener: None, volume: crate::model::UNITY_POS, mute: false, assign: vec!["A1".into()] })
+                .map(|_| StripCfg { name: String::new(), input: None, listener: None, volume: crate::model::UNITY_POS, mute: false, assign: vec!["A1".into()], force_mono: false })
                 .collect(),
         }
     }
@@ -196,6 +199,7 @@ impl Config {
                 volume: crate::model::UNITY_POS,
                 mute: false,
                 assign: vec!["A1".into()],
+                force_mono: false,
             });
         }
     }

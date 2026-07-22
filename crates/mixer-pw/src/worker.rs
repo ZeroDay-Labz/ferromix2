@@ -84,6 +84,8 @@ struct Desired {
     strip_input: HashMap<usize, String>,
     strip_vol: HashMap<usize, f32>,
     strip_mute: HashMap<usize, bool>,
+    /// strip -> force_mono (see `Strip.force_mono`'s doc comment).
+    strip_force_mono: HashMap<usize, bool>,
     /// (strip, bus) sends.
     assigns: HashSet<(usize, usize)>,
     buses: HashMap<usize, (String, BusKind)>,
@@ -125,6 +127,9 @@ struct WorkerState {
     /// (from, to) bus-to-bus feeds: `from`'s output additionally routed into
     /// `to`'s input.
     feeds: HashSet<(usize, usize)>,
+    /// (bus, strip) bus-to-strip feeds: `bus`'s output additionally routed
+    /// into `strip`'s device (the reverse of `Desired.assigns`).
+    bus_strip_feeds: HashSet<(usize, usize)>,
     /// bus -> app key whose MICROPHONE we point at it.
     bus_listener: HashMap<usize, String>,
     /// Same as `bus_listener`, for a strip acting as an app's mic feed.
@@ -1074,23 +1079,59 @@ fn reconcile(ctx: &Ctx) {
         for (idx, key) in inputs {
             let Some(&(strip_node, _)) = st.strip_nodes.get(&idx) else { continue };
             let srcs = resolve_source(&st.graph, &key);
+            let force_mono = st.desired.strip_force_mono.get(&idx).copied().unwrap_or(false);
             let dsp_target = st.dsp_nodes.get(&idx).and_then(|(i, o)| i.zip(*o));
             match dsp_target {
                 Some((dsp_in, dsp_out)) => {
-                    // Tear down any direct source->strip link left over from
-                    // before this strip's DSP module finished coming up.
+                    // `dsp_target` goes `Some` as soon as the DSP module's
+                    // NODE objects appear in the registry — which happens
+                    // strictly before their PORTS do (separate async
+                    // registry events). Previously this unconditionally cut
+                    // the working direct source→strip link right here,
+                    // before there was any confirmation the replacement
+                    // DspIn/DspOut links could actually form. Normally the
+                    // race is invisible (ports show up moments later in the
+                    // same sync burst and reconcile re-runs) — but if the
+                    // filter-chain module's internal gate+compressor graph
+                    // ever fails to fully negotiate ports (any
+                    // environment-specific LADSPA/module hiccup), the direct
+                    // link was already gone and the DSP link would never
+                    // form: permanent, total silence on that strip with no
+                    // way back short of restarting FerroMix. Fixed by
+                    // attempting the DSP links FIRST, and only cutting the
+                    // direct link once DspOut is CONFIRMED actually linked
+                    // in the live graph (not just "we asked for it") — worst
+                    // case during the handoff window you briefly hear both
+                    // paths, never silence, and a permanently-stuck module
+                    // just leaves you on the unprocessed direct signal
+                    // forever instead of killing the strip.
                     for &src in &srcs {
-                        remove_links_between(ctx, st, src, strip_node);
-                    }
-                    st.link_proxies.remove(&Slot::StripIn(idx));
-                    for &src in &srcs {
-                        ensure_links(&ctx.core, st, Slot::DspIn(idx), src, dsp_in);
+                        if force_mono {
+                            ensure_links_forced_mono(&ctx.core, st, Slot::DspIn(idx), src, dsp_in);
+                        } else {
+                            ensure_links(&ctx.core, st, Slot::DspIn(idx), src, dsp_in);
+                        }
                     }
                     ensure_links(&ctx.core, st, Slot::DspOut(idx), dsp_out, strip_node);
+                    let dsp_confirmed = st
+                        .graph
+                        .links
+                        .values()
+                        .any(|l| l.out_node == dsp_out && l.in_node == strip_node);
+                    if dsp_confirmed {
+                        for &src in &srcs {
+                            remove_links_between(ctx, st, src, strip_node);
+                        }
+                        st.link_proxies.remove(&Slot::StripIn(idx));
+                    }
                 }
                 None => {
                     for &src in &srcs {
-                        ensure_links(&ctx.core, st, Slot::StripIn(idx), src, strip_node);
+                        if force_mono {
+                            ensure_links_forced_mono(&ctx.core, st, Slot::StripIn(idx), src, strip_node);
+                        } else {
+                            ensure_links(&ctx.core, st, Slot::StripIn(idx), src, strip_node);
+                        }
                     }
                 }
             }
@@ -1253,6 +1294,20 @@ fn reconcile(ctx: &Ctx) {
             ensure_links(&ctx.core, st, Slot::Feed(from, to), src, dst);
         }
 
+        // 3d. Bus-to-strip feeds: a bus's output additionally routed into a
+        //     strip's device, the reverse of step 3's strip→bus sends. A
+        //     strip's meter stays pre-fader/source-only regardless (see
+        //     `sync_prefader_tap`), so this never makes a strip's meter move
+        //     — only its own assigned `input` does.
+        let bsf: Vec<(usize, usize)> = st.bus_strip_feeds.iter().copied().collect();
+        for (bus, strip) in bsf {
+            let (Some(&(src, _)), Some(&(dst, _))) = (st.bus_nodes.get(&bus), st.strip_nodes.get(&strip))
+            else {
+                continue;
+            };
+            ensure_links(&ctx.core, st, Slot::BusToStrip(bus, strip), src, dst);
+        }
+
         // 4. A-bus -> hardware device
         let hw_buses: Vec<usize> = st
             .desired
@@ -1343,6 +1398,26 @@ fn nname(st: &WorkerState, id: NodeId) -> String {
 
 fn ensure_links(core: &pw::core::CoreRc, st: &mut WorkerState, slot: Slot, out_node: NodeId, in_node: NodeId) {
     let pairs = links::pair_ports(&st.graph, out_node, in_node);
+    ensure_links_with_pairs(core, st, slot, out_node, in_node, pairs);
+}
+
+/// Same as `ensure_links`, for a strip input that has `force_mono` on —
+/// forces the source's first port into every destination channel evenly
+/// (see `links::pair_ports_forced_mono`'s doc comment) instead of the normal
+/// channel-matched/topology-based pairing.
+fn ensure_links_forced_mono(core: &pw::core::CoreRc, st: &mut WorkerState, slot: Slot, out_node: NodeId, in_node: NodeId) {
+    let pairs = links::pair_ports_forced_mono(&st.graph, out_node, in_node);
+    ensure_links_with_pairs(core, st, slot, out_node, in_node, pairs);
+}
+
+fn ensure_links_with_pairs(
+    core: &pw::core::CoreRc,
+    st: &mut WorkerState,
+    slot: Slot,
+    out_node: NodeId,
+    in_node: NodeId,
+    pairs: Vec<(u32, u32)>,
+) {
     if pairs.is_empty() {
         // Dump what ports each side actually exposes — this is how we catch a
         // bus that presents no input ports (e.g. a virtual source whose sink
@@ -1432,6 +1507,12 @@ fn remove_slot_links(ctx: &Ctx, slot: &Slot) {
         }
         Slot::Feed(from, to) => {
             match (st.bus_nodes.get(from).map(|(id, _)| *id), st.bus_nodes.get(to).map(|(id, _)| *id)) {
+                (Some(s), Some(d)) => Some((vec![s], d)),
+                _ => None,
+            }
+        }
+        Slot::BusToStrip(bus, strip) => {
+            match (st.bus_nodes.get(bus).map(|(id, _)| *id), st.strip_nodes.get(strip).map(|(id, _)| *id)) {
                 (Some(s), Some(d)) => Some((vec![s], d)),
                 _ => None,
             }
@@ -1568,6 +1649,16 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                 Err(e) => ctx.log(format!("DSP load FAILED for strip {}: {e}", idx + 1)),
             }
         }
+        PwCmd::SetStripForceMono { idx, on } => {
+            // The pairing scheme itself changes (normal vs. forced-mono), so
+            // tear down whatever's currently linked before flipping the flag
+            // — `ensure_links` only ADDS missing pairs, it won't notice the
+            // desired pairing changed under an unchanged Slot key.
+            remove_slot_links(ctx, &Slot::StripIn(idx));
+            remove_slot_links(ctx, &Slot::DspIn(idx));
+            ctx.st.borrow_mut().desired.strip_force_mono.insert(idx, on);
+            reconcile_all(ctx);
+        }
         PwCmd::SetFeedbackGuard { on } => {
             ctx.st.borrow_mut().feedback_guard = on;
             reconcile_all(ctx);
@@ -1683,6 +1774,18 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                 for to in feeds_out {
                     remove_slot_links(ctx, &Slot::Feed(idx, to));
                 }
+                // Same for bus-to-strip feeds this bus sends out.
+                let strip_feeds_out: Vec<usize> = ctx
+                    .st
+                    .borrow()
+                    .bus_strip_feeds
+                    .iter()
+                    .filter(|(bus, _)| *bus == idx)
+                    .map(|(_, strip)| *strip)
+                    .collect();
+                for strip in strip_feeds_out {
+                    remove_slot_links(ctx, &Slot::BusToStrip(idx, strip));
+                }
                 // A-bus (hardware output): drop its hardware-sink link too.
                 // This was missing entirely before — muting an A-bus never
                 // actually silenced it, since only listener/monitor links
@@ -1731,6 +1834,16 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                 reconcile_all(ctx);
             }
         }
+        PwCmd::SetBusStripFeed { bus, strip, on } => {
+            if on {
+                ctx.st.borrow_mut().bus_strip_feeds.insert((bus, strip));
+                reconcile_all(ctx);
+            } else {
+                ctx.st.borrow_mut().bus_strip_feeds.remove(&(bus, strip));
+                remove_slot_links(ctx, &Slot::BusToStrip(bus, strip));
+                reconcile_all(ctx);
+            }
+        }
         PwCmd::SetBusListener { bus, app_key } => {
             let old_key = ctx.st.borrow().bus_listener.get(&bus).cloned();
             {
@@ -1770,9 +1883,12 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                     }
                 }
             }
-            apply_listeners(ctx);
-            emit_listeners(ctx);
+            // `reconcile_all` already calls `apply_listeners` as its first
+            // step — call it before `emit_listeners` (not after, redundantly
+            // calling `apply_listeners` twice) so the reported listener list
+            // reflects the just-drawn links.
             reconcile_all(ctx);
+            emit_listeners(ctx);
         }
         PwCmd::SetStripListener { idx, app_key } => {
             {
@@ -1792,9 +1908,8 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
                     st.strip_listener.insert(idx, k);
                 }
             }
-            apply_listeners(ctx);
-            emit_listeners(ctx);
             reconcile_all(ctx);
+            emit_listeners(ctx);
         }
         PwCmd::StartRecord { target, path } => {
             // Strips and A-buses are sinks (record their monitor); B-buses are

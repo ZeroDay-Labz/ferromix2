@@ -47,6 +47,24 @@ pub fn pair_ports(graph: &Graph, out_node: NodeId, in_node: NodeId) -> Vec<(u32,
     pairs
 }
 
+/// Same fan-out as `pair_ports`'s mono-source case, but forced regardless of
+/// how many output ports the source actually presents — for a source that
+/// exposes a genuine stereo pair of ports but only ever writes audio into
+/// one of them (a real app quirk `pair_ports`'s own port-count-based
+/// detection can't see, since it's an audio-content property, not a
+/// topology one — a SIP softphone that's "mono content in two stereo ports"
+/// is the reported case). Takes the first output port only (channel-ranked,
+/// so FL/MONO wins over FR if both exist) and duplicates it into every
+/// destination channel evenly, exactly like a true single-port mono source.
+pub fn pair_ports_forced_mono(graph: &Graph, out_node: NodeId, in_node: NodeId) -> Vec<(u32, u32)> {
+    let outs = graph.out_ports(out_node);
+    let ins = graph.in_ports(in_node);
+    if outs.is_empty() || ins.is_empty() {
+        return Vec::new();
+    }
+    ins.iter().map(|i| (outs[0].id, i.id)).collect()
+}
+
 pub fn create_link(
     core: &pw::core::CoreRc,
     out_node: NodeId,
@@ -93,6 +111,24 @@ mod tests {
         assert_eq!(pairs.len(), 2, "mono must reach BOTH channels, not one ear");
         assert!(pairs.contains(&(10, 20)));
         assert!(pairs.contains(&(10, 21)));
+    }
+
+    #[test]
+    fn forced_mono_ignores_second_output_port_and_fans_first_into_both() {
+        // A source that presents a real stereo PAIR of ports (unlike the
+        // single-MONO-port case above) but only ever writes audio into FL —
+        // the case pair_ports' port-count detection can't see, since it's a
+        // content property. Forced mono should still land it in both ears.
+        let g = graph_with(vec![
+            port(10, 1, Dir::Out, Some("FL")),
+            port(11, 1, Dir::Out, Some("FR")),
+            port(20, 2, Dir::In, Some("FL")),
+            port(21, 2, Dir::In, Some("FR")),
+        ]);
+        let pairs = pair_ports_forced_mono(&g, 1, 2);
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.contains(&(10, 20)));
+        assert!(pairs.contains(&(10, 21)), "forced mono must duplicate FL into FR too, not just pass FL/FR through unchanged");
     }
 
     #[test]

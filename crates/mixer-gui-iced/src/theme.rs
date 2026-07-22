@@ -38,10 +38,6 @@ pub const SEG_OFF: Color = rgb(0x18, 0x1e, 0x33);
 pub const REC_RED: Color = rgb(0xff, 0x4d, 0x5e);
 pub const DANGER: Color = rgb(0xff, 0x4d, 0x5e);
 
-pub fn with_alpha(c: Color, a: f32) -> Color {
-    Color { a, ..c }
-}
-
 /// The dark base theme.
 pub fn base() -> iced::Theme {
     iced::Theme::custom(
@@ -56,16 +52,19 @@ pub fn base() -> iced::Theme {
     )
 }
 
+/// The shadow every card shares — tinted toward the deep background blue
+/// rather than flat black, which reads as a richer glass effect than a
+/// muddy generic drop-shadow.
+fn card_shadow() -> Shadow {
+    Shadow { color: BG_DEEP.scale_alpha(0.6), offset: Vector::new(0.0, 4.0), blur_radius: 16.0 }
+}
+
 /// A glass card container style.
 pub fn card(_t: &iced::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(Background::Color(CARD)),
         border: Border { color: EDGE_SOFT, width: 1.0, radius: 8.0.into() },
-        shadow: Shadow {
-            color: Color { a: 0.35, ..BG_DEEP },
-            offset: Vector::new(0.0, 3.0),
-            blur_radius: 12.0,
-        },
+        shadow: card_shadow(),
         text_color: Some(TEXT),
     }
 }
@@ -76,30 +75,12 @@ pub fn card(_t: &iced::Theme) -> iced::widget::container::Style {
 /// normal accent edge a moment after you stop interacting with it. Just the
 /// outline, no glow/shadow bloom — that read as too much.
 pub fn card_accent(accent: Color, active: bool) -> impl Fn(&iced::Theme) -> iced::widget::container::Style {
-    move |_t| {
-        if active {
-            iced::widget::container::Style {
-                background: Some(Background::Color(CARD)),
-                border: Border { color: MIC_AMBER, width: 2.0, radius: 8.0.into() },
-                shadow: Shadow {
-                    color: Color { a: 0.35, ..BG_DEEP },
-                    offset: Vector::new(0.0, 3.0),
-                    blur_radius: 12.0,
-                },
-                text_color: Some(TEXT),
-            }
-        } else {
-            iced::widget::container::Style {
-                background: Some(Background::Color(CARD)),
-                border: Border { color: with_alpha(accent, 0.45), width: 1.0, radius: 8.0.into() },
-                shadow: Shadow {
-                    color: Color { a: 0.35, ..BG_DEEP },
-                    offset: Vector::new(0.0, 3.0),
-                    blur_radius: 12.0,
-                },
-                text_color: Some(TEXT),
-            }
-        }
+    let (edge_color, edge_width) = if active { (MIC_AMBER, 2.0) } else { (accent.scale_alpha(0.45), 1.0) };
+    move |_t| iced::widget::container::Style {
+        background: Some(Background::Color(CARD)),
+        border: Border { color: edge_color, width: edge_width, radius: 8.0.into() },
+        shadow: card_shadow(),
+        text_color: Some(TEXT),
     }
 }
 

@@ -265,6 +265,9 @@ impl AudioBackend for MockBackend {
         // No live audio graph to splice DSP into in mock mode.
         Ok(())
     }
+    fn set_strip_force_mono(&mut self, _idx: usize, _on: bool) -> BackendResult {
+        Ok(())
+    }
     fn ensure_bus(&mut self, idx: usize, label: &str, kind: BusKind) -> BackendResult {
         let mut sh = self.shared.lock().unwrap();
         sh.n_buses = sh.n_buses.max(idx + 1);

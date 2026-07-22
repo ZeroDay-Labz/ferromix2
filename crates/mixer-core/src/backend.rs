@@ -45,6 +45,11 @@ pub trait AudioBackend: Send {
     /// with the new values.
     fn set_strip_dsp(&mut self, idx: usize, dsp: StripDsp) -> BackendResult;
 
+    /// See `Strip.force_mono`'s doc comment — forces the input link to fan
+    /// the source's first port into every destination channel evenly,
+    /// regardless of how many output ports the source really has.
+    fn set_strip_force_mono(&mut self, idx: usize, on: bool) -> BackendResult;
+
     fn ensure_bus(&mut self, idx: usize, label: &str, kind: BusKind) -> BackendResult;
     fn set_bus_device(&mut self, idx: usize, device: Option<String>) -> BackendResult;
     fn set_bus_volume(&mut self, bus_idx: usize, volume: f32) -> BackendResult;

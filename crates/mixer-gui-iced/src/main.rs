@@ -114,6 +114,7 @@ fn command_target(c: &Command) -> Option<RenameTarget> {
         | SetStripVolume { strip, .. }
         | SetStripMute { strip, .. }
         | SetStripDsp { strip, .. }
+        | SetStripForceMono { strip, .. }
         | SetStripListener { strip, .. } => Some(RenameTarget::Strip(strip)),
         ToggleAssign { strip, .. } => Some(RenameTarget::Strip(strip)),
         SetBusVolume { bus, .. }
@@ -123,6 +124,7 @@ fn command_target(c: &Command) -> Option<RenameTarget> {
         | SetBusListener { bus, .. } => Some(RenameTarget::Bus(bus)),
         ToggleBusMonitor { bus, .. } => Some(RenameTarget::Bus(bus)),
         ToggleBusFeed { from, .. } => Some(RenameTarget::Bus(from)),
+        ToggleBusStripFeed { bus, .. } => Some(RenameTarget::Bus(bus)),
         StartRecordTarget { target } | StopRecordTarget { target } => match target {
             mixer_core::model::RecTarget::Strip(s) => Some(RenameTarget::Strip(s)),
             mixer_core::model::RecTarget::Bus(b) => Some(RenameTarget::Bus(b)),
@@ -362,7 +364,7 @@ impl App {
         let save_btn = button(text(save_label).size(11).color(save_fg))
             .style(move |_t, _s| iced::widget::button::Style {
                 background: Some(iced::Background::Color(if self.dirty {
-                    theme::with_alpha(theme::MIC_AMBER, 0.12)
+                    theme::MIC_AMBER.scale_alpha(0.12)
                 } else {
                     iced::Color::TRANSPARENT
                 })),

@@ -132,6 +132,15 @@ pub struct Strip {
     /// Apps currently capturing from this strip — who is actually listening.
     #[serde(default)]
     pub listeners: Vec<String>,
+    /// Force the input to be treated as mono regardless of how many ports
+    /// the source actually presents — fixes a source that exposes a real
+    /// stereo port pair but only ever writes audio into one of them (a SIP
+    /// softphone was the reported case: "the phone call only comes out my
+    /// right ear"), which the normal port-count-based mono detection can't
+    /// see since it's a content property, not a topology one. When on, the
+    /// first output port is duplicated evenly into every input channel.
+    #[serde(default)]
+    pub force_mono: bool,
 }
 
 /// Per-strip signal processing. A downward noise gate followed by a soft-knee
@@ -195,6 +204,7 @@ impl Strip {
             dsp: StripDsp::default(),
             listener: None,
             listeners: Vec::new(),
+            force_mono: false,
         }
     }
 }
