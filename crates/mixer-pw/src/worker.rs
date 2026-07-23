@@ -113,6 +113,13 @@ struct WorkerState {
     /// Any ferromix.* device seen in the registry, awaiting adoption.
     bus_by_name: HashMap<String, (NodeId, pw::node::Node)>,
     feedback_guard: bool,
+    /// Master bypass — see `Command::SetEnabled`'s doc comment. Gates
+    /// `reconcile_all` itself (checked once, at the top) so every caller —
+    /// command handlers and the registry-event debounce timer alike —
+    /// automatically respects it without each needing its own check.
+    /// Explicitly set `true` at construction in `run()`, same reasoning as
+    /// `feedback_guard` — `#[derive(Default)]` alone would leave it `false`.
+    enabled: bool,
     last_feedback_pairs: Vec<(usize, usize)>,
     last_listeners: Vec<(usize, Vec<String>)>,
     /// The PipeWire "default" metadata object — how `wpctl set-default` and
@@ -240,6 +247,7 @@ pub(crate) fn run(cmd_rx: pw::channel::Receiver<PwCmd>, ev_tx: Sender<BackendEve
         ev_tx: ev_tx.clone(),
         st: Rc::new(RefCell::new(WorkerState {
             feedback_guard: true,
+            enabled: true,
             desired: Desired { sample_rate: 48_000, ..Default::default() },
             ..Default::default()
         })),
@@ -1158,8 +1166,46 @@ fn listens(
 /// command reconverges listener links too, matching the "declarative
 /// reconciler" architecture (see docs/ARCHITECTURE.md).
 fn reconcile_all(ctx: &Ctx) {
+    // Master bypass gate — see `Command::SetEnabled`'s doc comment. Checked
+    // once, here, so every caller (command handlers, the registry-event
+    // debounce timer) automatically no-ops while off instead of each
+    // needing its own check; `PwCmd::SetEnabled`'s own handler is the only
+    // thing that touches the graph directly while disabled (its release
+    // pass runs before flipping this flag).
+    if !ctx.st.borrow().enabled {
+        return;
+    }
     apply_listeners(ctx);
     reconcile(ctx);
+}
+
+/// Tears down everything FerroMix has established in the live graph —
+/// every `target.object` write on an app's output stream, and every link
+/// it has drawn across every `Slot` kind (strip inputs, DSP chains, sends
+/// to buses, bus-to-device, SEND TO APP listener redirects — literally
+/// every entry in `link_proxies`) — without touching `st.desired.*`, so
+/// the routing config itself isn't lost, just not enforced. This is what
+/// makes `Command::SetEnabled { on: false }` mean "go back to stock
+/// PipeWire": once this returns, nothing an app does is pointed at a
+/// FerroMix device by us anymore, and `reconcile_all`'s bypass gate stops
+/// anything from re-establishing it until `on: true` reconciles from
+/// scratch.
+fn release_all(ctx: &Ctx) {
+    let stream_nodes: Vec<NodeId> = ctx.st.borrow().stream_targets.keys().copied().collect();
+    {
+        let mut st = ctx.st.borrow_mut();
+        if let Some(md) = st.metadata.as_ref() {
+            for n in &stream_nodes {
+                md.set_property(*n, "target.object", None, None);
+            }
+        }
+        st.stream_targets.clear();
+        st.capture_targets.clear();
+    }
+    let slots: Vec<Slot> = ctx.st.borrow().link_proxies.keys().cloned().collect();
+    for slot in slots {
+        remove_slot_links(ctx, &slot);
+    }
 }
 
 fn reconcile(ctx: &Ctx) {
@@ -1898,6 +1944,23 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
         PwCmd::SetFeedbackGuard { on } => {
             ctx.st.borrow_mut().feedback_guard = on;
             reconcile_all(ctx);
+        }
+        PwCmd::SetEnabled { on } => {
+            // Logged engine-side (`Command::SetEnabled`'s handler) — not
+            // here too, to avoid a duplicate entry in the activity log.
+            if on {
+                ctx.st.borrow_mut().enabled = true;
+                // Desired state (`st.desired.*`) was never touched while
+                // off — this re-applies it exactly as it was, from scratch:
+                // re-links everything, re-writes every target.object.
+                reconcile_all(ctx);
+            } else {
+                // Release BEFORE flipping the flag — `release_all` calls
+                // `remove_slot_links`/`reconcile_all`-adjacent helpers that
+                // are themselves no-ops once `enabled` is false.
+                release_all(ctx);
+                ctx.st.borrow_mut().enabled = false;
+            }
         }
         PwCmd::SetSampleRate { rate } => {
             // Only affects nodes created AFTER this point — see the

@@ -41,10 +41,12 @@ pub mod type_scale {
 
 /// Layout breakpoints for the responsive strip/bus card row.
 pub mod layout {
-    /// Never shrink a strip card narrower than this before falling back to
-    /// horizontal scrolling.
+    /// Never shrink a strip card narrower than this before wrapping onto an
+    /// additional row (see `wrap_cards` in `main.rs`).
     pub const STRIP_MIN: f32 = 130.0;
     /// Never grow a strip card wider than this — extra width should go to
-    /// gaps, not oversized cards.
-    pub const STRIP_MAX: f32 = 210.0;
+    /// gaps, not oversized cards. Tuned so a typical 5-strip + B1/B2/B3
+    /// setup (8 cards) fits on one row at the default 1620px window instead
+    /// of needing an unusually wide window before wrapping kicks in.
+    pub const STRIP_MAX: f32 = 160.0;
 }

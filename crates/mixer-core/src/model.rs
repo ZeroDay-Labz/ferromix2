@@ -304,6 +304,10 @@ pub struct MixerState {
     /// doc comment. Mirrored here so the Settings picker can show which rate
     /// is currently active.
     pub sample_rate: u32,
+    /// Master bypass state — see `Config.enabled`'s doc comment. Drives the
+    /// header's LIVE/OFF indicator independent of `connected` (the socket
+    /// can be fine while FerroMix is deliberately not routing anything).
+    pub enabled: bool,
     pub log: Vec<String>,
 }
 

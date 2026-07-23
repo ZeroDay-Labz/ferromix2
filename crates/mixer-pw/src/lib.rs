@@ -33,6 +33,7 @@ pub(crate) enum PwCmd {
     SetStripDsp { idx: usize, dsp: StripDsp },
     SetStripForceMono { idx: usize, on: bool },
     SetFeedbackGuard { on: bool },
+    SetEnabled { on: bool },
     SetSampleRate { rate: u32 },
     EnsureBus { idx: usize, label: String, kind: BusKind },
     SetBusDevice { idx: usize, device: Option<String> },
@@ -100,6 +101,9 @@ impl AudioBackend for PwBackend {
     }
     fn set_feedback_guard(&mut self, on: bool) -> BackendResult {
         self.send(PwCmd::SetFeedbackGuard { on })
+    }
+    fn set_enabled(&mut self, on: bool) -> BackendResult {
+        self.send(PwCmd::SetEnabled { on })
     }
     fn set_sample_rate(&mut self, rate: u32) -> BackendResult {
         self.send(PwCmd::SetSampleRate { rate })

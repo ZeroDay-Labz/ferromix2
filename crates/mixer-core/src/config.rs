@@ -84,6 +84,15 @@ pub struct Config {
     /// per-node.
     #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
+    /// Master bypass. When `false`, FerroMix releases every app it's
+    /// redirected (hands `target.object` back to WirePlumber's own default
+    /// policy) and stops reconciling — your system behaves like stock
+    /// PipeWire, FerroMix's own strip/bus nodes just sit idle. `true`
+    /// re-applies the same routing config you already have, instantly (it's
+    /// never cleared, just not enforced while off). See
+    /// `Command::SetEnabled`'s doc comment.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub buses: Vec<BusCfg>,
     #[serde(default, rename = "strip")]
@@ -120,6 +129,7 @@ impl Default for Config {
             recordings_dir: None,
             strip_count: 5,
             ui_scale: 0.0, // auto
+            enabled: true,
             sample_rate: 48_000,
             buses: vec![
                 BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), strip_feeds: Vec::new(), input: None, listener: None, label: "A1".into(), kind: "hw".into(), device: None, volume: crate::model::UNITY_POS, mute: false },

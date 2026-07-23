@@ -68,6 +68,16 @@ pub enum Command {
     /// append-only symmetry avoids all of that. Refused (no-op) if only one
     /// strip remains.
     RemoveLastStrip,
+    /// Master bypass toggle. `on: false` releases every app FerroMix has
+    /// currently redirected (clears `target.object` metadata, handing
+    /// control back to WirePlumber's own default policy) and stops the
+    /// reconciler from doing anything further — your system behaves like
+    /// stock PipeWire. Desired routing state (which strip has which input,
+    /// which sends are on, etc.) is NOT cleared, just not enforced while
+    /// off, so `on: true` snaps everything back exactly where it was —
+    /// this is a pause, not a reset. Persisted (`Config.enabled`) so a
+    /// daemon restart doesn't silently re-enable it.
+    SetEnabled { on: bool },
     Save,
 }
 
@@ -204,6 +214,7 @@ fn initial_state(cfg: &Config) -> MixerState {
         feedback_guard: cfg.feedback_guard,
         ui_scale: cfg.ui_scale,
         sample_rate: cfg.sample_rate,
+        enabled: cfg.enabled,
         log: Vec::new(),
     }
 }
@@ -308,6 +319,10 @@ fn run(
     {
         let st = state.lock().unwrap();
         let _ = backend.set_feedback_guard(config.feedback_guard);
+        // Must land before any push_strip/set_bus_* calls below reach the
+        // backend — if starting up disabled, nothing should get actively
+        // redirected during the initial sync either.
+        let _ = backend.set_enabled(config.enabled);
         // Must land before any ensure_strip/ensure_bus below — those create
         // the actual adapter nodes, which are pinned to whatever rate is
         // current at creation time (see `AudioBackend::set_sample_rate`).
@@ -755,6 +770,18 @@ fn run(
                     st.feedback_guard = on;
                     st.push_log(format!("{} feedback guard {}", ts(), if on { "ON" } else { "OFF" }));
                     let _ = backend.set_feedback_guard(on);
+                }
+                Command::SetEnabled { on } => {
+                    config.enabled = on;
+                    st.enabled = on;
+                    let _ = config.save();
+                    st.push_log(format!(
+                        "{} FerroMix {} — {}",
+                        ts(),
+                        if on { "ON" } else { "OFF" },
+                        if on { "routing config applied" } else { "released to stock PipeWire" }
+                    ));
+                    let _ = backend.set_enabled(on);
                 }
                 Command::AddStrip => {
                     let n = st.buses.len();

@@ -63,6 +63,11 @@ pub trait AudioBackend: Send {
 
     fn set_feedback_guard(&mut self, on: bool) -> BackendResult;
 
+    /// Master bypass — see `Command::SetEnabled`'s doc comment. `false`
+    /// releases every app currently redirected and stops the reconciler
+    /// from doing anything further; `true` re-applies desired state as-is.
+    fn set_enabled(&mut self, on: bool) -> BackendResult;
+
     /// The rate every newly-created strip/bus adapter node is pinned to —
     /// see `Command::SetSampleRate`'s doc comment. Only affects nodes
     /// created AFTER this call; existing nodes keep whatever rate they were

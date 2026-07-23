@@ -308,6 +308,9 @@ impl AudioBackend for MockBackend {
         self.shared.lock().unwrap().guard = on;
         Ok(())
     }
+    fn set_enabled(&mut self, _on: bool) -> BackendResult {
+        Ok(())
+    }
     fn set_sample_rate(&mut self, _rate: u32) -> BackendResult {
         Ok(())
     }

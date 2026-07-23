@@ -7,7 +7,7 @@ use crate::tokens;
 use crate::Message;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space};
-use iced::{Alignment, Border, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme};
+use iced::{Alignment, Background, Border, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme};
 use crate::RenameTarget;
 use mixer_core::engine::Command;
 use mixer_core::model::{pos_to_db, Bus, BusKind, MixerState, RecTarget, Strip, StripDsp};
@@ -22,16 +22,37 @@ const FADER_W: f32 = 20.0;
 /// below runs its base color through, so hovering and pressing always give
 /// real, consistent feedback.
 pub fn interactive(base: Color, status: button::Status) -> Color {
-    let mix = |c: Color, target: f32, amount: f32| Color {
-        r: c.r + (target - c.r) * amount,
-        g: c.g + (target - c.g) * amount,
-        b: c.b + (target - c.b) * amount,
-        a: c.a,
-    };
+    mix(base, status_target(status).0, status_target(status).1)
+}
+
+fn mix(c: Color, target: f32, amount: f32) -> Color {
+    Color { r: c.r + (target - c.r) * amount, g: c.g + (target - c.g) * amount, b: c.b + (target - c.b) * amount, a: c.a }
+}
+
+fn status_target(status: button::Status) -> (f32, f32) {
     match status {
-        button::Status::Hovered => mix(base, 1.0, 0.14),
-        button::Status::Pressed => mix(base, 0.0, 0.16),
-        button::Status::Active | button::Status::Disabled => base,
+        button::Status::Hovered => (1.0, 0.14),
+        button::Status::Pressed => (0.0, 0.16),
+        button::Status::Active | button::Status::Disabled => (0.0, 0.0),
+    }
+}
+
+/// A filled "on" surface with real depth instead of a flat color — a subtle
+/// top-lit vertical gradient (mirrors `theme::card_gradient`'s reasoning) at
+/// rest, falling back to the flat `interactive()` hover/press mix while
+/// actually being interacted with (a gradient sliding under the cursor mid-
+/// hover would read as a glitch, not polish). Used for every "lit" pill/
+/// button — send pills, MUTE/REC when armed, the active tab — so the same
+/// glassy language established for cards carries through to controls too.
+pub fn accent_fill(base: Color, status: button::Status) -> Background {
+    match status {
+        button::Status::Hovered | button::Status::Pressed => Background::Color(interactive(base, status)),
+        button::Status::Active | button::Status::Disabled => Background::Gradient(
+            iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2))
+                .add_stop(0.0, mix(base, 1.0, 0.22))
+                .add_stop(1.0, base)
+                .into(),
+        ),
     }
 }
 
@@ -39,10 +60,15 @@ pub fn tab_button(label: &str, active: bool) -> button::Button<'_, Message> {
     let fg = if active { theme::ACCENT } else { theme::TEXT_DIM };
     button(text(label).size(tokens::type_scale::SUBTITLE).color(fg))
         .style(move |_t, s| {
-            let base = if active { theme::ACCENT.scale_alpha(0.12) } else { Color::TRANSPARENT };
-            let bg = if matches!(s, button::Status::Hovered) && !active { theme::EDGE_SOFT.scale_alpha(0.5) } else { base };
+            let bg = if active {
+                accent_fill(theme::ACCENT.scale_alpha(0.16), s)
+            } else if matches!(s, button::Status::Hovered) {
+                Background::Color(theme::EDGE_SOFT.scale_alpha(0.5))
+            } else {
+                Background::Color(Color::TRANSPARENT)
+            };
             button::Style {
-                background: Some(iced::Background::Color(bg)),
+                background: Some(bg),
                 border: Border { color: if active { theme::ACCENT } else { theme::EDGE_SOFT }, width: 1.0, radius: tokens::radius::MD.into() },
                 text_color: fg, ..Default::default()
             }
@@ -57,7 +83,7 @@ fn send_pill<'a>(label: impl Into<String>, on: bool, fb: bool, is_b: bool, msg: 
         else if on { (accent, theme::BG_DEEP, accent) }
         else { (theme::SEG_OFF, theme::TEXT_DIM, theme::EDGE) };
     button(text(label).size(tokens::type_scale::LABEL).color(fg).center().width(Length::Fill))
-        .style(move |_t, s| button::Style { background: Some(iced::Background::Color(interactive(bg, s))), border: Border { color: edge, width: 1.0, radius: tokens::radius::SM.into() }, text_color: fg, ..Default::default() })
+        .style(move |_t, s| button::Style { background: Some(accent_fill(bg, s)), border: Border { color: edge, width: 1.0, radius: tokens::radius::SM.into() }, text_color: fg, ..Default::default() })
         .width(Length::Fixed(38.0)).padding([4, 0]).on_press(msg).into()
 }
 
@@ -101,7 +127,7 @@ fn rec_button<'a>(recording: bool, target: RecTarget) -> Element<'a, Message> {
 fn wide_button<'a>(label: &'a str, on: bool, accent: Color, msg: Message) -> Element<'a, Message> {
     let (bg, fg) = if on { (accent, theme::BG_DEEP) } else { (theme::PANEL_HI, theme::TEXT_DIM) };
     button(text(label).size(tokens::type_scale::LABEL).color(fg).center().width(Length::Fill))
-        .style(move |_t, s| button::Style { background: Some(iced::Background::Color(interactive(bg, s))), border: Border { color: if on { accent } else { theme::EDGE }, width: 1.0, radius: tokens::radius::MD.into() }, text_color: fg, ..Default::default() })
+        .style(move |_t, s| button::Style { background: Some(accent_fill(bg, s)), border: Border { color: if on { accent } else { theme::EDGE }, width: 1.0, radius: tokens::radius::MD.into() }, text_color: fg, ..Default::default() })
         .width(Length::Fill).padding([6, 0]).on_press(msg).into()
 }
 
@@ -295,7 +321,7 @@ fn knob<'a>(label: &'a str, value: f32, on: bool, accent: Color, strip: usize, d
         .height(Length::Fixed(48.0));
     let toggle = { let ndsp = if is_gate { StripDsp { gate_on: !dsp.gate_on, ..dsp } } else { StripDsp { comp_on: !dsp.comp_on, ..dsp } }; Message::Send(Command::SetStripDsp { strip, dsp: ndsp }) };
     let lbl = button(text(label).size(tokens::type_scale::CAPTION).color(if on { accent } else { theme::TEXT_DIM }).center().width(Length::Fill))
-        .style(move |_t, s| button::Style { background: Some(iced::Background::Color(interactive(if on { accent.scale_alpha(0.15) } else { theme::SEG_OFF }, s))), border: Border { color: if on { accent } else { theme::EDGE }, width: 1.0, radius: tokens::radius::SM.into() }, text_color: if on { accent } else { theme::TEXT_DIM }, ..Default::default() })
+        .style(move |_t, s| button::Style { background: Some(accent_fill(if on { accent.scale_alpha(0.15) } else { theme::SEG_OFF }, s)), border: Border { color: if on { accent } else { theme::EDGE }, width: 1.0, radius: tokens::radius::SM.into() }, text_color: if on { accent } else { theme::TEXT_DIM }, ..Default::default() })
         .width(Length::Fixed(48.0)).padding([2, 0]).on_press(toggle);
     column![dial, lbl].spacing(3).align_x(Alignment::Center).into()
 }
@@ -619,7 +645,7 @@ fn strip_routing_section<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState
 }
 
 fn strip_fader_section<'a>(idx: usize, strip: &'a Strip, accent: Color) -> Element<'a, Message> {
-    let meter = Canvas::new(Meter { level: strip.level, accent }).width(Length::Fixed(30.0)).height(Length::Fixed(FADER_H));
+    let meter = Canvas::new(Meter { level: strip.level, accent }).width(Length::Fixed(34.0)).height(Length::Fixed(FADER_H));
     let fad = fader(strip.volume, accent, mixer_core::model::UNITY_POS, move |v| Message::Send(Command::SetStripVolume { strip: idx, volume: v }));
     row![meter, Space::with_width(4), fad, Space::with_width(8), text(fmt_db(strip.volume)).size(tokens::type_scale::BODY).color(theme::TEXT)].align_y(Alignment::Center).into()
 }
@@ -717,7 +743,7 @@ fn bus_routing_section<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState, acce
 }
 
 fn bus_fader_section<'a>(idx: usize, bus: &'a Bus, accent: Color) -> Element<'a, Message> {
-    let meter = Canvas::new(Meter { level: bus.level, accent }).width(Length::Fixed(30.0)).height(Length::Fixed(FADER_H));
+    let meter = Canvas::new(Meter { level: bus.level, accent }).width(Length::Fixed(34.0)).height(Length::Fixed(FADER_H));
     let fad = fader(bus.volume, accent, mixer_core::model::UNITY_POS, move |v| Message::Send(Command::SetBusVolume { bus: idx, volume: v }));
     row![meter, Space::with_width(4), fad, Space::with_width(8), text(fmt_db(bus.volume)).size(tokens::type_scale::BODY).color(theme::TEXT)].align_y(Alignment::Center).into()
 }
@@ -741,17 +767,46 @@ fn bus_send_sections<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState) -> Ele
     // Bus-to-strip: this bus's output additionally feeding one or more
     // strips (the reverse of a strip's own send-to-bus pills) — e.g. B1 as a
     // shared "everything" channel feeding back into the input strips.
-    let mut to_strips = row![].spacing(3);
+    // Wraps onto extra rows (3 per row) rather than overflowing the card —
+    // with `STRIP_MAX` tuned down so 8 cards fit a default-width window
+    // (see `tokens::layout::STRIP_MAX`'s doc comment), a card is no longer
+    // wide enough to fit more than ~3-4 of these pills on one line once the
+    // strip count grows past a handful.
+    let mut to_strip_pills: Vec<Element<Message>> = Vec::new();
     for si in 0..state.strips.len() {
         let on = bus.strip_feeds.get(si).copied().unwrap_or(false);
-        to_strips = to_strips.push(send_pill(format!("S{}", si + 1), on, false, true, Message::Send(Command::ToggleBusStripFeed { bus: idx, strip: si })));
+        to_strip_pills.push(send_pill(format!("S{}", si + 1), on, false, true, Message::Send(Command::ToggleBusStripFeed { bus: idx, strip: si })));
     }
+    let to_strips = pill_grid(to_strip_pills, 3);
     column![
         section_label("MONITOR ON"), Space::with_height(2), mon,
         Space::with_height(6), section_label("FEED →"), Space::with_height(2), feed,
         Space::with_height(6), section_label("FEED → STRIPS"), Space::with_height(2), to_strips,
     ]
     .spacing(0).into()
+}
+
+/// Wraps `pills` (fixed-width `send_pill`s) into rows of `per_row`, so a
+/// group that doesn't fit on one line grows downward instead of overflowing
+/// the card. Same idea as `main.rs`'s `wrap_cards`, just for the smaller
+/// fixed-size pill elements used inside a card rather than whole cards.
+fn pill_grid<'a>(pills: Vec<Element<'a, Message>>, per_row: usize) -> Element<'a, Message> {
+    let mut rows = column![].spacing(3);
+    let mut r = row![].spacing(3);
+    let mut n = 0;
+    for p in pills {
+        r = r.push(p);
+        n += 1;
+        if n == per_row {
+            rows = rows.push(r);
+            r = row![].spacing(3);
+            n = 0;
+        }
+    }
+    if n > 0 {
+        rows = rows.push(r);
+    }
+    rows.into()
 }
 
 fn bus_footer<'a>(idx: usize, bus: &'a Bus) -> Element<'a, Message> {
@@ -789,25 +844,15 @@ pub fn hw_out_slot<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState) -> Eleme
         Message::Send(Command::SetBusDevice { bus: idx, device })
     });
     let mute = button(icons::icon(icons::Icon::Mute, 12.0, if bus.mute { theme::BG_DEEP } else { theme::TEXT_DIM }))
-        .style(move |_t, s| button::Style { background: Some(iced::Background::Color(interactive(if bus.mute { theme::REC_RED } else { theme::PANEL_HI }, s))), border: Border { color: theme::EDGE, width: 1.0, radius: tokens::radius::SM.into() }, text_color: theme::TEXT_DIM, ..Default::default() })
+        .style(move |_t, s| button::Style { background: Some(accent_fill(if bus.mute { theme::REC_RED } else { theme::PANEL_HI }, s)), border: Border { color: theme::EDGE, width: 1.0, radius: tokens::radius::SM.into() }, text_color: theme::TEXT_DIM, ..Default::default() })
         .padding([4, 8]).on_press(Message::Send(Command::SetBusMute { bus: idx, mute: !bus.mute }));
     let top = row![text(&bus.label).size(tokens::type_scale::TITLE).color(theme::ACCENT), Space::with_width(8), dd, Space::with_width(6), mute].align_y(Alignment::Center);
-    // Direct input + meter, same feature as bus_card's — restored after
-    // being intentionally removed a couple of rounds ago (A-buses considered
-    // output-only at the time). An A-bus can now also have any live
-    // app/device assigned directly, same freedom strips and B-buses have —
-    // its meter reflects ONLY that assigned source (pre-fader), not the real
-    // mix reaching the speakers. Silent unless you assign one here.
-    let in_opts: Vec<Opt> = state.inputs.iter().map(|i| Opt { key: i.key.clone(), label: i.label.clone() }).collect();
-    let in_sel = bus.input.as_ref().and_then(|k| in_opts.iter().find(|o| &o.key == k).cloned());
-    let input_dd = dropdown("◆ INPUT (drives meter)", clearable_opts(in_opts), in_sel, move |o: Opt| {
-        let input = if o.key == NONE_KEY { None } else { Some(o.key) };
-        Message::Send(Command::SetBusInput { bus: idx, input })
-    });
-    let meter = Canvas::new(Meter { level: bus.level, accent: theme::ACCENT }).width(Length::Fixed(24.0)).height(Length::Fixed(36.0));
-    let bottom = row![meter, Space::with_width(6), input_dd].align_y(Alignment::Center);
-    container(column![top, Space::with_height(4), bottom].spacing(0))
-        .padding(tokens::space::SM).width(Length::Fixed(340.0)).style(theme::card).into()
+    // A-buses are hardware outputs, not sources — no direct input/meter
+    // here (that's what strips and B-buses are for). This flip-flopped a
+    // couple of rounds this session; settled per explicit direction: "A1 A2
+    // A3 do not need input because they are not driving meters, that's our
+    // hardware outputs."
+    container(top).padding(tokens::space::SM).width(Length::Fixed(340.0)).style(theme::card).into()
 }
 
 /// A single bus's entry in `rec_panel` — a small fixed-width chip (label over
@@ -828,7 +873,7 @@ fn mini_rec_chip<'a>(label: &'a str, accent: Color, recording: bool, target: Rec
         (theme::PANEL_HI, theme::TEXT_DIM, theme::EDGE)
     };
     let btn = button(text(if recording { "■" } else { "●" }).size(tokens::type_scale::CAPTION).color(fg).center().width(Length::Fill))
-        .style(move |_t, s| button::Style { background: Some(iced::Background::Color(interactive(bg, s))), border: Border { color: edge, width: 1.0, radius: tokens::radius::SM.into() }, text_color: fg, ..Default::default() })
+        .style(move |_t, s| button::Style { background: Some(accent_fill(bg, s)), border: Border { color: edge, width: 1.0, radius: tokens::radius::SM.into() }, text_color: fg, ..Default::default() })
         .width(Length::Fixed(22.0)).padding([3, 0]).on_press(msg);
     column![text(label).size(tokens::type_scale::CAPTION).color(accent), Space::with_height(3), btn]
         .align_x(Alignment::Center)
@@ -905,7 +950,7 @@ pub fn matrix_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
             };
             let cell = button(mark)
                 .style(move |_t, s| button::Style {
-                    background: Some(iced::Background::Color(interactive(bg, s))),
+                    background: Some(accent_fill(bg, s)),
                     border: Border { color: if on || fb { bg } else { theme::EDGE }, width: 1.0, radius: tokens::radius::MD.into() },
                     text_color: theme::BG_DEEP, ..Default::default()
                 })
@@ -986,7 +1031,7 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
         .width(Length::Fill);
     let apply_btn = button(text("APPLY").size(tokens::type_scale::CAPTION).color(theme::BG_DEEP).center())
         .style(|_t, s| button::Style {
-            background: Some(iced::Background::Color(interactive(theme::ACCENT, s))),
+            background: Some(accent_fill(theme::ACCENT, s)),
             border: Border { color: theme::ACCENT, width: 1.0, radius: tokens::radius::SM.into() },
             text_color: theme::BG_DEEP,
             ..Default::default()
@@ -1011,7 +1056,7 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
     let step_btn = move |label: &'static str, delta: f32| -> Element<'a, Message> {
         button(text(label).size(tokens::type_scale::SUBTITLE).color(theme::TEXT).center().width(Length::Fill))
             .style(|_t, s| button::Style {
-                background: Some(iced::Background::Color(interactive(theme::PANEL_HI, s))),
+                background: Some(accent_fill(theme::PANEL_HI, s)),
                 border: Border { color: theme::EDGE, width: 1.0, radius: tokens::radius::SM.into() },
                 text_color: theme::TEXT,
                 ..Default::default()
@@ -1046,7 +1091,7 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
         let (bg, fg, edge) = if on { (theme::ACCENT, theme::BG_DEEP, theme::ACCENT) } else { (theme::PANEL_HI, theme::TEXT_DIM, theme::EDGE) };
         button(text(format!("{rate}")).size(tokens::type_scale::LABEL).color(fg).center().width(Length::Fill))
             .style(move |_t, s| button::Style {
-                background: Some(iced::Background::Color(interactive(bg, s))),
+                background: Some(accent_fill(bg, s)),
                 border: Border { color: edge, width: 1.0, radius: tokens::radius::SM.into() },
                 text_color: fg,
                 ..Default::default()
@@ -1083,7 +1128,7 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
     );
 
     let reset_btn = button(text("⟲ RESET AUDIO TO STOCK PIPEWIRE").size(tokens::type_scale::LABEL).color(theme::BG_DEEP).center().width(Length::Fill))
-        .style(|_t, s| button::Style { background: Some(iced::Background::Color(interactive(theme::MIC_AMBER, s))), border: Border { color: theme::MIC_AMBER, width: 1.0, radius: tokens::radius::SM.into() }, text_color: theme::BG_DEEP, ..Default::default() })
+        .style(|_t, s| button::Style { background: Some(accent_fill(theme::MIC_AMBER, s)), border: Border { color: theme::MIC_AMBER, width: 1.0, radius: tokens::radius::SM.into() }, text_color: theme::BG_DEEP, ..Default::default() })
         .padding([8, 0])
         .on_press(Message::ResetAudio);
     let recovery = card(
@@ -1102,7 +1147,7 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
         column![
             section("ABOUT"),
             Space::with_height(8),
-            text("FerroMix2 — an open-source Voicemeeter-class mixer for Linux / PipeWire.").size(tokens::type_scale::LABEL).color(theme::TEXT),
+            text("FerroMix2 — an open-source Virtual mixer for Linux / PipeWire.").size(tokens::type_scale::LABEL).color(theme::TEXT),
             text("Every strip receives one source. A-buses you hear; B-buses are virtual mics apps read. MUTE cuts a strip everywhere.").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM),
         ]
         .spacing(0)
@@ -1138,7 +1183,7 @@ pub fn log_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
         lines = lines.push(text(line).size(tokens::type_scale::LABEL).color(theme::TEXT_DIM).font(iced::Font::MONOSPACE));
     }
     let copy_btn = button(text("⧉ COPY LOG").size(tokens::type_scale::LABEL).color(theme::TEXT_DIM))
-        .style(|_t, s| button::Style { background: Some(iced::Background::Color(interactive(theme::PANEL_HI, s))), border: Border { color: theme::EDGE, width: 1.0, radius: tokens::radius::MD.into() }, text_color: theme::TEXT_DIM, ..Default::default() })
+        .style(|_t, s| button::Style { background: Some(accent_fill(theme::PANEL_HI, s)), border: Border { color: theme::EDGE, width: 1.0, radius: tokens::radius::MD.into() }, text_color: theme::TEXT_DIM, ..Default::default() })
         .padding([6, 12])
         .on_press(Message::CopyLog);
     let head = row![
