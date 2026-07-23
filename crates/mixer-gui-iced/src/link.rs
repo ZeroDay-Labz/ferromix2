@@ -60,54 +60,100 @@ pub enum FromLink {
     Disconnected(String),
 }
 
+/// Is a `ferromix2-daemon` process already running? Checked before spawning
+/// one ourselves — the daemon unconditionally `remove_file`s and rebinds its
+/// socket at startup with no "already running" guard of its own
+/// (`mixer-daemon/src/ipc.rs`), so launching a second instance while one is
+/// already up would steal the socket path out from under it and leave two
+/// daemons independently fighting to own the same PipeWire node names. This
+/// is a best-effort check (relies on `pgrep` being present, true on every
+/// mainstream Linux desktop) — worst case it's a false negative and we
+/// still just fail to connect, same as before this existed.
+fn daemon_already_running() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-x", "ferromix2-daemon"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Best-effort: launch the daemon ourselves so the app works as a single
+/// double-click launch (the `.desktop` entry only runs the GUI — see
+/// `assets/ferromix2.desktop` — relying on this to bring the daemon up
+/// rather than requiring the systemd --user service to already be enabled).
+/// Detached (`spawn()`, not waited on) — if the binary isn't on `PATH`
+/// (e.g. a dev build run straight from `target/debug/`) this just silently
+/// does nothing and the existing connect-retry loop behaves exactly as it
+/// did before this existed.
+fn try_launch_daemon() {
+    if daemon_already_running() {
+        return;
+    }
+    let _ = std::process::Command::new("ferromix2-daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 /// Spawn the blocking link worker. Returns a sender for commands and a receiver
 /// for state snapshots. Reconnects on drop of the daemon.
 pub fn spawn() -> (Sender<ToLink>, Receiver<FromLink>) {
     let (to_tx, to_rx) = std::sync::mpsc::channel::<ToLink>();
     let (from_tx, from_rx) = std::sync::mpsc::channel::<FromLink>();
 
-    std::thread::spawn(move || loop {
-        let mut link = match Link::connect() {
-            Ok(l) => {
-                let _ = from_tx.send(FromLink::Connected);
-                l
-            }
-            Err(e) => {
-                let _ = from_tx.send(FromLink::Disconnected(e));
-                std::thread::sleep(Duration::from_millis(600));
-                match to_rx.try_recv() {
-                    Ok(ToLink::Stop) => return,
-                    _ => continue,
-                }
-            }
-        };
-
-        // Connected: pump commands + poll state at ~30 Hz.
+    std::thread::spawn(move || {
+        // Attempted once per GUI process lifetime, on the very first
+        // connect failure — not on every retry, so a genuinely-missing
+        // binary (dev builds) doesn't reattempt a spawn every 600ms forever.
+        let mut tried_launch = false;
         loop {
-            while let Ok(msg) = to_rx.try_recv() {
-                match msg {
-                    ToLink::Cmd(c) => {
-                        if link.send(c).is_err() {
-                            let _ = from_tx.send(FromLink::Disconnected("send failed".into()));
-                        }
-                    }
-                    ToLink::Stop => return,
-                }
-            }
-            match link.poll_state() {
-                Ok(s) => {
-                    if from_tx.send(FromLink::State(Box::new(s))).is_err() {
-                        return; // UI gone
-                    }
+            let mut link = match Link::connect() {
+                Ok(l) => {
+                    let _ = from_tx.send(FromLink::Connected);
+                    l
                 }
                 Err(e) => {
+                    if !tried_launch {
+                        tried_launch = true;
+                        try_launch_daemon();
+                    }
                     let _ = from_tx.send(FromLink::Disconnected(e));
-                    break; // reconnect
+                    std::thread::sleep(Duration::from_millis(600));
+                    match to_rx.try_recv() {
+                        Ok(ToLink::Stop) => return,
+                        _ => continue,
+                    }
                 }
+            };
+
+            // Connected: pump commands + poll state at ~30 Hz.
+            loop {
+                while let Ok(msg) = to_rx.try_recv() {
+                    match msg {
+                        ToLink::Cmd(c) => {
+                            if link.send(c).is_err() {
+                                let _ = from_tx.send(FromLink::Disconnected("send failed".into()));
+                            }
+                        }
+                        ToLink::Stop => return,
+                    }
+                }
+                match link.poll_state() {
+                    Ok(s) => {
+                        if from_tx.send(FromLink::State(Box::new(s))).is_err() {
+                            return; // UI gone
+                        }
+                    }
+                    Err(e) => {
+                        let _ = from_tx.send(FromLink::Disconnected(e));
+                        break; // reconnect
+                    }
+                }
+                // Matches main.rs's subscription poll rate (~60Hz) — snappier
+                // meters than the old 33ms/~30Hz.
+                std::thread::sleep(Duration::from_millis(16));
             }
-            // Matches main.rs's subscription poll rate (~60Hz) — snappier
-            // meters than the old 33ms/~30Hz.
-            std::thread::sleep(Duration::from_millis(16));
         }
     });
 
