@@ -1,7 +1,7 @@
 [Unit]
 Description=FerroMix2 virtual audio mixer daemon
 After=pipewire.service wireplumber.service
-Wants=pipewire.service
+Wants=pipewire.service wireplumber.service
 
 [Service]
 ExecStart=/usr/bin/ferromix2-daemon

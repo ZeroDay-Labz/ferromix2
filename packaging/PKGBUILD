@@ -1,6 +1,6 @@
 # Maintainer: you <you@example.com>
 pkgname=ferromix2-git
-pkgver=2.4.0
+pkgver=2.7.0
 pkgrel=1
 pkgdesc="Voicemeeter-style virtual audio mixer for PipeWire"
 arch=('x86_64')

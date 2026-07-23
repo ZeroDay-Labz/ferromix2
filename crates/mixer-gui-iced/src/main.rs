@@ -355,7 +355,16 @@ impl App {
             Message::Tick
         });
         let resize = iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size.width));
-        Subscription::batch([poll, resize])
+        // Escape aborts an in-progress rename without submitting it —
+        // `RenameCancel` existed as dead code (a variant with a working
+        // `update()` arm but nothing ever constructed it: no click-away or
+        // key handler wired it up), so there was no way to back out of a
+        // rename short of typing the original text back and hitting Enter.
+        let keys = iced::keyboard::on_key_press(|key, _modifiers| match key {
+            iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape) => Some(Message::RenameCancel),
+            _ => None,
+        });
+        Subscription::batch([poll, resize, keys])
     }
 
     /// Strip/bus card width for the current window: shrinks smoothly between

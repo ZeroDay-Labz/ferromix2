@@ -171,8 +171,6 @@ struct WorkerState {
     bus_listener: HashMap<usize, String>,
     /// Same as `bus_listener`, for a strip acting as an app's mic feed.
     strip_listener: HashMap<usize, String>,
-    /// capture node -> bus/strip name we already pointed it at.
-    capture_targets: HashMap<NodeId, String>,
     /// (bus idx, capture node) -> unit, tracking B-bus→app-mic links we drew
     /// ourselves so we can tear them down when the assignment changes.
     listener_links: HashMap<(usize, NodeId), ()>,
@@ -426,7 +424,6 @@ fn on_global_remove(ctx: &Ctx, id: u32) {
         if let Some(node) = st.graph.nodes.remove(&id) {
             st.bound.remove(&id);
             st.stream_targets.remove(&id);
-            st.capture_targets.remove(&id);
             st.bus_by_name.remove(&node.name);
             if let Some((idx, is_in)) = dsp_node_role(&node.name) {
                 // The module itself owns this node's lifetime; if it vanished
@@ -1200,7 +1197,6 @@ fn release_all(ctx: &Ctx) {
             }
         }
         st.stream_targets.clear();
-        st.capture_targets.clear();
     }
     let slots: Vec<Slot> = ctx.st.borrow().link_proxies.keys().cloned().collect();
     for slot in slots {
@@ -1349,11 +1345,21 @@ fn reconcile(ctx: &Ctx) {
             // Metadata write is still latched to once-per-(node,target): this
             // is the part that risked the destroy/recreate war if repeated.
             if st.stream_targets.get(node) != Some(target) {
-                st.stream_targets.insert(*node, target.clone());
                 if let Some(md) = st.metadata.as_ref() {
                     let json = format!("\"{target}\"");
                     md.set_property(*node, "target.object", Some("Spa:String:JSON"), Some(&json));
                     log::info!("TARGET {} -> {}", nname(st, *node), target);
+                    // Only latch on actual success — recorded before this
+                    // guard used to run unconditionally, so a startup race
+                    // (this app's node appearing before the "default"
+                    // metadata object bound) permanently marked the redirect
+                    // "done" even though no write ever happened, and it was
+                    // never retried: that app would keep playing to its
+                    // original destination forever. Leaving the latch unset
+                    // on failure means the next reconcile pass (any registry
+                    // event sets `dirty`) retries automatically once
+                    // metadata binds.
+                    st.stream_targets.insert(*node, target.clone());
                 } else {
                     log::warn!("cannot retarget {}: no metadata object", nname(st, *node));
                 }
@@ -1750,16 +1756,7 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             // APP), mirroring SetStripListener's release block.
             {
                 let mut st = ctx.st.borrow_mut();
-                if let Some(old) = st.strip_listener.remove(&idx) {
-                    let nodes = resolve_capture(&st.graph, &old);
-                    for n in nodes {
-                        if st.capture_targets.remove(&n).is_some() {
-                            if let Some(md) = st.metadata.as_ref() {
-                                md.set_property(n, "target.object", None, None);
-                            }
-                        }
-                    }
-                }
+                st.strip_listener.remove(&idx);
             }
 
             // Tear down every link this strip participates in.
@@ -2157,16 +2154,7 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             {
                 let mut st = ctx.st.borrow_mut();
                 // Release the previous app so WirePlumber can place it normally.
-                if let Some(old) = st.bus_listener.remove(&bus) {
-                    let nodes = resolve_capture(&st.graph, &old);
-                    for n in nodes {
-                        if st.capture_targets.remove(&n).is_some() {
-                            if let Some(md) = st.metadata.as_ref() {
-                                md.set_property(n, "target.object", None, None);
-                            }
-                        }
-                    }
-                }
+                st.bus_listener.remove(&bus);
                 if let Some(k) = app_key {
                     st.bus_listener.insert(bus, k);
                 }
@@ -2202,16 +2190,7 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             {
                 let mut st = ctx.st.borrow_mut();
                 // Release the previous app so WirePlumber can place it normally.
-                if let Some(old) = st.strip_listener.remove(&idx) {
-                    let nodes = resolve_capture(&st.graph, &old);
-                    for n in nodes {
-                        if st.capture_targets.remove(&n).is_some() {
-                            if let Some(md) = st.metadata.as_ref() {
-                                md.set_property(n, "target.object", None, None);
-                            }
-                        }
-                    }
-                }
+                st.strip_listener.remove(&idx);
                 if let Some(k) = app_key {
                     st.strip_listener.insert(idx, k);
                 }

@@ -10,7 +10,7 @@ use iced::widget::{button, column, container, pick_list, row, scrollable, text, 
 use iced::{Alignment, Background, Border, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme};
 use crate::RenameTarget;
 use mixer_core::engine::Command;
-use mixer_core::model::{pos_to_db, Bus, BusKind, MixerState, RecTarget, Strip, StripDsp};
+use mixer_core::model::{pos_to_db, Bus, BusKind, MixerState, RecTarget, SourceKind, Strip, StripDsp};
 
 const FADER_H: f32 = 150.0;
 const FADER_W: f32 = 20.0;
@@ -707,6 +707,25 @@ fn bus_routing_section<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState, acce
         let input = if o.key == NONE_KEY { None } else { Some(o.key) };
         Message::Send(Command::SetBusInput { bus: idx, input })
     });
+    // A bus's INPUT is metering-only by design (see `Bus.input`'s doc
+    // comment — routing it for real risks feeding an app's own voice back
+    // into its own mic capture). Picking an app here silently does nothing
+    // to what you actually hear from it, which reads as "the fader/mute are
+    // broken" — confirmed live confusion, not a hypothetical. Surface it
+    // instead of leaving it a silent trap.
+    let app_input_warn: Element<Message> = match bus
+        .input
+        .as_deref()
+        .and_then(|k| state.inputs.iter().find(|i| i.key == k))
+    {
+        Some(i) if i.kind == SourceKind::App => {
+            text("⚠ meter only — this app's audio is NOT routed here. To control its volume, assign it as a STRIP's input and send that strip to a hardware bus.")
+                .size(tokens::type_scale::CAPTION)
+                .color(theme::MIC_AMBER)
+                .into()
+        }
+        _ => Space::with_height(0).into(),
+    };
     let opts: Vec<Opt> = state.capture_apps.iter().map(|a| Opt { key: a.key.clone(), label: a.label.clone() }).collect();
     let sel = bus.listener.as_ref().and_then(|k| opts.iter().find(|o| &o.key == k).cloned());
     let app_dd = dropdown("◇ SEND TO APP", clearable_opts(opts), sel, move |o: Opt| {
@@ -738,7 +757,7 @@ fn bus_routing_section<'a>(idx: usize, bus: &'a Bus, state: &'a MixerState, acce
     } else {
         text(format!("⚠ same app also on {}", dup_others.join(", "))).size(tokens::type_scale::CAPTION).color(theme::MIC_AMBER).into()
     };
-    column![section_label("ROUTING"), Space::with_height(3), input_dd, Space::with_height(4), app_dd, Space::with_height(3), listening, dup_note]
+    column![section_label("ROUTING"), Space::with_height(3), input_dd, app_input_warn, Space::with_height(4), app_dd, Space::with_height(3), listening, dup_note]
         .spacing(0).into()
 }
 
