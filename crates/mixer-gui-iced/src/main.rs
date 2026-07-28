@@ -38,9 +38,37 @@ const ACTIVE_HIGHLIGHT: Duration = Duration::from_millis(1100);
 const DEFAULT_WINDOW: (f32, f32) = (1620.0, 780.0);
 const MIN_WINDOW: (f32, f32) = (960.0, 600.0);
 
+/// Native Wayland windowing can crash outright on some hybrid-GPU laptops —
+/// confirmed live on Fedora 44 with an NVIDIA discrete + Intel integrated
+/// GPU: wgpu picks an adapter, then panics importing a dmabuf for the window
+/// surface ("Fallback system failed to choose present mode. This is a bug.")
+/// — a wgpu/winit-level bug, not anything FerroMix's own code touches.
+/// Rather than expect every user on affected hardware to discover and set
+/// `WINIT_UNIX_BACKEND=x11` by hand, install a panic hook that relaunches
+/// this same binary once with XWayland forced if that happens, so it just
+/// works without the user ever seeing the crash. `FERROMIX_RELAUNCHED`
+/// guards against looping if the second attempt panics too (a genuine,
+/// unrelated bug shouldn't retry forever) — in that case it just crashes
+/// normally, same as before this existed.
+fn install_xwayland_fallback() {
+    if std::env::var_os("FERROMIX_RELAUNCHED").is_some() {
+        return;
+    }
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("panic during startup, retrying once under XWayland: {info}");
+        let exe = std::env::current_exe().unwrap_or_else(|_| "ferromix2".into());
+        let _ = std::process::Command::new(exe)
+            .env("WINIT_UNIX_BACKEND", "x11")
+            .env("FERROMIX_RELAUNCHED", "1")
+            .spawn();
+        std::process::exit(1);
+    }));
+}
+
 fn main() -> iced::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     log::info!("FerroMix Iced console starting");
+    install_xwayland_fallback();
     iced::application("FerroMix2", App::update, App::view)
         .subscription(App::subscription)
         .theme(|_| theme::base())

@@ -26,6 +26,10 @@ mixer-pw = { path = "../mixer-pw" }
 # LADSPA compressor package Fedora calls `ladspa-swh-plugins` (see
 # packaging/ferromix2.spec's Requires and README's Fedora section).
 [package.metadata.deb]
+# Defaults to the crate name (mixer-gui-iced) otherwise, which is what
+# actually shipped in v3.0.0 — not the "ferromix2" branding used everywhere
+# else (binary name, RPM, tarball).
+name = "ferromix2"
 maintainer = "FerroMix contributors <noreply@example.com>"
 copyright = "2026, FerroMix contributors"
 license-file = ["../../LICENSE", "0"]

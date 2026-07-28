@@ -1,5 +1,5 @@
 Name:           ferromix2
-Version:        3.0.0
+Version:        3.0.1
 Release:        1%{?dist}
 Summary:        Voicemeeter-style virtual audio mixer for PipeWire
 
@@ -7,6 +7,11 @@ License:        MIT
 URL:            https://github.com/ZeroDay-Labz/ferromix2
 # Generate with: git archive --prefix=%{name}-%{version}/ -o %{name}-%{version}.tar.gz HEAD
 Source0:        %{name}-%{version}.tar.gz
+
+# v3.0.0's release shipped ferromix2-debuginfo/-debugsource RPMs nobody
+# asked for (rpmbuild's default behavior) — not broken, just clutter next
+# to a single self-contained binary with no separate library consumers.
+%global debug_package %{nil}
 
 BuildRequires:  rust
 BuildRequires:  cargo
@@ -55,6 +60,14 @@ install -Dm644 assets/%{name}.svg %{buildroot}%{_datadir}/icons/hicolor/scalable
 %{_datadir}/icons/hicolor/scalable/apps/%{name}.svg
 
 %changelog
+* Tue Jul 28 2026 FerroMix contributors <noreply@example.com> - 3.0.1-1
+- FIX: native Wayland windowing could crash outright on hybrid-GPU laptops
+  (confirmed live: NVIDIA discrete + Intel integrated, Fedora 44) — wgpu
+  picked an adapter, then panicked importing a dmabuf for the window
+  surface. The GUI now catches this at startup and automatically
+  relaunches itself once under XWayland instead, no user action needed.
+- Stopped shipping %{name}-debuginfo/%{name}-debugsource RPMs — clutter
+  next to a single self-contained binary.
 * Tue Jul 28 2026 FerroMix contributors <noreply@example.com> - 3.0.0-1
 - BREAKING: merged the daemon and GUI into a single process. There is no
   more `%{name}-daemon` binary and no more systemd --user service — launch

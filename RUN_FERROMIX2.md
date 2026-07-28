@@ -216,3 +216,26 @@ used to be a second process staying alive on purpose).
   on purpose) no longer takes the whole window down with it. Shows briefly
   as "reconnecting…" in the header.
 - Packaging follows: RPM/PKGBUILD ship one binary, no `.service` unit.
+
+## v3.0.1 — hybrid-GPU Wayland crash, packaging cleanup
+
+First real-world report from v3.0.0: a Fedora 44 install with an NVIDIA
+discrete + Intel integrated GPU crashed on launch — `wgpu` picked an
+adapter, then panicked importing a dmabuf for the window surface
+("Fallback system failed to choose present mode. This is a bug."), a
+wgpu/winit-level issue on certain hybrid-GPU + native-Wayland
+combinations, not anything in FerroMix's own PipeWire/routing code (that
+part of the log was completely healthy — strips linked, buses linked,
+routing correct).
+
+- FIX: `install_xwayland_fallback` in `main.rs` installs a panic hook at
+  startup that, on any panic, relaunches the same binary once with
+  `WINIT_UNIX_BACKEND=x11` forced (XWayland instead of native Wayland,
+  sidestepping the dmabuf import path entirely) — guarded by
+  `FERROMIX_RELAUNCHED` so a genuine unrelated crash doesn't loop, it
+  just crashes normally on the second try same as before. No user action
+  needed either way.
+- The `.deb` package was accidentally named `mixer-gui-iced_*.deb`
+  (cargo-deb defaults to the crate name) instead of `ferromix2_*.deb`.
+- Stopped shipping the RPM's auto-generated `-debuginfo`/`-debugsource`
+  subpackages — clutter next to a single self-contained binary.

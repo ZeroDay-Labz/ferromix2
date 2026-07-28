@@ -119,6 +119,15 @@ ducking (e.g. notification sounds ducking music) for every app, not just
 FerroMix. See the comment in that file for the full trade-off. FerroMix
 routes correctly either way; this just makes it proactive instead of reactive.
 
+## Troubleshooting
+
+**Window crashes on launch with `wgpu`/`EGL`/dmabuf errors** (seen on hybrid-
+GPU laptops — an NVIDIA discrete + Intel integrated GPU under native
+Wayland): fixed as of v3.0.1 — FerroMix now detects this at startup and
+automatically relaunches itself once under XWayland, no action needed. If
+you're still on an older build, launch it with `WINIT_UNIX_BACKEND=x11`
+in the meantime.
+
 ## Config
 
 `~/.config/ferromix2/config.toml` — the header's SAVE indicator writes it back
