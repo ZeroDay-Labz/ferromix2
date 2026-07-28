@@ -158,7 +158,8 @@ jobs:
           flatpak install --user -y flathub \
             org.freedesktop.Platform//25.08 \
             org.freedesktop.Sdk//25.08 \
-            org.freedesktop.Sdk.Extension.rust-stable//25.08
+            org.freedesktop.Sdk.Extension.rust-stable//25.08 \
+            org.freedesktop.Sdk.Extension.llvm20//25.08
       - name: Build flatpak bundle
         env:
           VERSION: ${{ needs.version.outputs.version }}

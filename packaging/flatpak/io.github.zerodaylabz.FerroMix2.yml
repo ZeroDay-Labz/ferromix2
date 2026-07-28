@@ -24,6 +24,12 @@ runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
+  # bindgen (pulled in by mixer-pw's pipewire-sys/libspa-sys) needs libclang
+  # at build time, which the base Sdk does NOT ship — confirmed live:
+  # "Unable to find libclang" even though the Sdk's own gcc/clang *compiler*
+  # driver is present (that's a different thing from bindgen's libclang.so
+  # backend). This extension provides it.
+  - org.freedesktop.Sdk.Extension.llvm20
 command: ferromix2
 
 finish-args:
@@ -94,7 +100,9 @@ modules:
   - name: ferromix2
     buildsystem: simple
     build-options:
-      append-path: /usr/lib/sdk/rust-stable/bin
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
+      env:
+        LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
       build-args:
         # Not vendoring a cargo-sources.json for an offline build (the
         # Flathub-required approach) since this isn't submitted to Flathub —
