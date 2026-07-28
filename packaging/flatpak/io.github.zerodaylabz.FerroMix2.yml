@@ -73,6 +73,17 @@ modules:
       - -Dsystemd-system-service=disabled
       - -Dsystemd-user-service=disabled
       - -Dselinux=disabled
+      # `-Dpipewire-alsa` (above) is the ALSA *client* integration
+      # (libasound plugin so ALSA-only apps can play through PipeWire) — it's
+      # a different option from `alsa`, the SPA plugin that lets PipeWire
+      # *talk to real ALSA hardware*, which we don't need (we're a client of
+      # the host's already-running PipeWire server, never a server driving
+      # hardware ourselves) and whose udev rule install tried to write
+      # outside /app: `OSError: [Errno 30] Read-only file system:
+      # '/usr/lib/udev'`, confirmed live. `udevrulesdir` is set too as a
+      # fallback in case any other enabled component ever tries the same.
+      - -Dalsa=disabled
+      - -Dudevrulesdir=/app/lib/udev/rules.d
     sources:
       - type: git
         url: https://gitlab.freedesktop.org/pipewire/pipewire.git
