@@ -18,3 +18,33 @@ env_logger = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 mixer-pw = { path = "../mixer-pw" }
+
+# Consumed by `cargo deb` (see .github/workflows/release.yml's `deb` job) —
+# builds packaging/ferromix2.spec's Debian/Ubuntu equivalent: one binary, the
+# desktop entry, and the icon, no separate daemon/service (see the v3.0.0
+# single-process merge). `swh-plugins` is Debian/Ubuntu's name for the same
+# LADSPA compressor package Fedora calls `ladspa-swh-plugins` (see
+# packaging/ferromix2.spec's Requires and README's Fedora section).
+[package.metadata.deb]
+maintainer = "FerroMix contributors <noreply@example.com>"
+copyright = "2026, FerroMix contributors"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+FerroMix2 is a Voicemeeter-Potato-class virtual mixer for Linux, built on \
+PipeWire and WirePlumber. It routes any app to any hardware output or \
+virtual microphone, keeps routes alive by app name (a call ending doesn't \
+destroy your patch), refuses to build the feedback loops that ruin a \
+mix-minus setup, and runs per-strip noise-gate/compressor DSP. Launch it \
+and it owns PipeWire directly for as long as it's open; close it and \
+everything is torn down cleanly."""
+depends = "pipewire, wireplumber, swh-plugins"
+section = "sound"
+priority = "optional"
+assets = [
+    # All paths here are relative to THIS Cargo.toml's directory, including
+    # the binary — cargo workspaces share one `target/` at the repo root,
+    # not one per crate, so this is ../../target, not target.
+    ["../../target/release/ferromix2", "usr/bin/", "755"],
+    ["../../assets/ferromix2.desktop", "usr/share/applications/", "644"],
+    ["../../assets/ferromix2.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+]
