@@ -1,0 +1,171 @@
+name: Release
+
+# Tag pushes (v3.0.0, v3.0.1, ...) build all three packages and publish a
+# GitHub Release with them attached. `workflow_dispatch` runs the exact same
+# build without publishing anything — just uploads the artifacts to the
+# Actions run — so a new/changed job (the Flatpak one especially, see its
+# manifest's own header comment) can be exercised and inspected before it's
+# ever attached to a real, public release.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (no leading v) — defaults to Cargo.toml'
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      is_release: ${{ steps.v.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+            if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
+              echo "::error::tag v$TAG_VERSION does not match Cargo.toml's workspace version ($CARGO_VERSION) — bump one of them"
+              exit 1
+            fi
+            echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+            if [[ -z "$VERSION" ]]; then VERSION="$CARGO_VERSION"; fi
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  tarball:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang pkg-config libpipewire-0.3-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked -p mixer-gui-iced
+      - name: Package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          DIR="ferromix2-${VERSION}-x86_64-linux"
+          install -Dm755 target/release/ferromix2 "$DIR/bin/ferromix2"
+          install -Dm644 assets/ferromix2.desktop "$DIR/share/applications/ferromix2.desktop"
+          install -Dm644 assets/ferromix2.svg "$DIR/share/icons/hicolor/scalable/apps/ferromix2.svg"
+          install -Dm644 LICENSE "$DIR/LICENSE"
+          install -Dm644 README.md "$DIR/README.md"
+          tar -czf "${DIR}.tar.gz" "$DIR"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: ferromix2-*-x86_64-linux.tar.gz
+          if-no-files-found: error
+
+  rpm:
+    needs: version
+    runs-on: ubuntu-latest
+    # Fedora, not Ubuntu: `packaging/ferromix2.spec` is an RPM spec and its
+    # BuildRequires (pipewire-devel, clang-devel, ...) are Fedora package
+    # names. `:latest` rather than a pinned release so this doesn't quietly
+    # go stale the way a hardcoded version number would.
+    container: fedora:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          dnf install -y rpm-build rpmdevtools git rust cargo clang-devel pkgconf-pkg-config pipewire-devel
+      - name: Build RPM
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Actions checks out as a different uid than the container's rpmbuild
+          # user expects to own the tree; without this git refuses to touch it.
+          git config --global --add safe.directory "$PWD"
+          rpmdev-setuptree
+          git archive --prefix="ferromix2-${VERSION}/" -o "$HOME/rpmbuild/SOURCES/ferromix2-${VERSION}.tar.gz" HEAD
+          cp packaging/ferromix2.spec "$HOME/rpmbuild/SPECS/ferromix2.spec"
+          rpmbuild -ba "$HOME/rpmbuild/SPECS/ferromix2.spec"
+          mkdir -p dist
+          cp "$HOME"/rpmbuild/RPMS/*/*.rpm dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  flatpak:
+    needs: version
+    runs-on: ubuntu-latest
+    # See packaging/flatpak/io.github.zerodaylabz.FerroMix2.yml's header
+    # comment: this pipeline is new and unverified. Failing here must not
+    # take down the RPM/tar.gz release those don't depend on it — see the
+    # `release` job's `fail_on_unmatched_files: false` below.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install flatpak-builder + runtimes
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub \
+            org.freedesktop.Platform//23.08 \
+            org.freedesktop.Sdk//23.08 \
+            org.freedesktop.Sdk.Extension.rust-stable//23.08
+      - name: Build flatpak bundle
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          flatpak-builder --user --force-clean --repo=repo build-dir \
+            packaging/flatpak/io.github.zerodaylabz.FerroMix2.yml
+          flatpak build-bundle repo "ferromix2-${VERSION}.flatpak" io.github.zerodaylabz.FerroMix2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: ferromix2-*.flatpak
+          if-no-files-found: error
+
+  release:
+    needs: [version, tarball, rpm, flatpak]
+    # Only real version tags publish — workflow_dispatch runs stop at the
+    # per-job artifacts above so a build can be sanity-checked without
+    # creating a public Release.
+    if: needs.version.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # The flatpak job is allowed to fail (see its `continue-on-error`)
+          # while it's still stabilizing, in which case dist/flatpak/ won't
+          # exist — don't fail the whole release over a glob with no match.
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+          files: |
+            dist/tarball/*.tar.gz
+            dist/rpm/*.rpm
+            dist/flatpak/*.flatpak

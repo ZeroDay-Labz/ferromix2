@@ -1,0 +1,106 @@
+# Flatpak manifest for FerroMix2.
+#
+# NOTE for maintainers: this manifest is new and, unlike the RPM/tar.gz
+# packaging, has not yet been confirmed to produce a working build — it was
+# written against documented flatpak-builder/PipeWire/cargo conventions but
+# needs a real CI run (see .github/workflows/release.yml's `flatpak` job) to
+# prove out. The most likely failure points if it doesn't build clean on the
+# first try: the `pipewire` module's meson `config-opts` (option names/
+# defaults drift between PipeWire releases) and the pinned `tag:` below going
+# stale. Check the Actions log and adjust those two spots first.
+#
+# Why FerroMix2 builds its own PipeWire instead of using the runtime's: the
+# freedesktop runtime ships PipeWire's *shared libraries* (for portal/screen-
+# share use by other apps) but not its *development* headers/pkgconfig files,
+# which `mixer-pw`'s bindgen-based bindings need at compile time. Building a
+# minimal client-only PipeWire here (no ALSA/PulseAudio/JACK compat, no
+# session manager, no server-side extras) gives us those headers without
+# depending on undocumented runtime internals. At *runtime* the sandboxed app
+# still talks to the HOST's already-running PipeWire server over
+# `--socket=pipewire` — it never starts a server of its own.
+id: io.github.zerodaylabz.FerroMix2
+runtime: org.freedesktop.Platform
+runtime-version: '23.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: ferromix2
+
+finish-args:
+  # Window display (Wayland native, X11 fallback for non-Wayland sessions).
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # GPU access for iced's wgpu renderer.
+  - --device=dri
+  # The actual audio graph — talks to the HOST's PipeWire server.
+  - --socket=pipewire
+  # RESET AUDIO / sample-rate change restart PipeWire+WirePlumber via
+  # `systemctl --user` on the host; `mixer_core::engine::host_command`
+  # detects the sandbox and routes this through `flatpak-spawn --host`,
+  # which needs this permission.
+  - --talk-name=org.freedesktop.Flatpak
+  # So bus/strip recordings can land somewhere the user can actually find
+  # them (see `Config.recordings_dir`'s default: `dirs::audio_dir()`).
+  - --filesystem=xdg-music:create
+
+modules:
+  - name: pipewire
+    buildsystem: meson
+    config-opts:
+      - -Dsession-managers=[]
+      - -Dpipewire-alsa=disabled
+      - -Dpipewire-v4l2=disabled
+      - -Dpipewire-pulseaudio=disabled
+      - -Dpipewire-jack=disabled
+      - -Dgstreamer=disabled
+      - -Dgstreamer-device-provider=disabled
+      - -Dffmpeg=disabled
+      - -Dbluez5=disabled
+      - -Davahi=disabled
+      - -Dvulkan=disabled
+      - -Dsdl2=disabled
+      - -Ddocs=disabled
+      - -Dman=disabled
+      - -Dtests=disabled
+      - -Dexamples=disabled
+      - -Dinstalled-tests=disabled
+      - -Dsystemd=disabled
+      - -Dsystemd-system-service=disabled
+      - -Dsystemd-user-service=disabled
+      - -Dselinux=disabled
+    sources:
+      - type: git
+        url: https://gitlab.freedesktop.org/pipewire/pipewire.git
+        # Bump periodically — pinned so builds are reproducible rather than
+        # silently picking up whatever `master` happens to be.
+        tag: 1.2.7
+
+  - name: ferromix2
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      build-args:
+        # Not vendoring a cargo-sources.json for an offline build (the
+        # Flathub-required approach) since this isn't submitted to Flathub —
+        # it's a self-hosted bundle, so a plain networked `cargo build`
+        # against crates.io is simpler and one less generated file to keep in
+        # sync with Cargo.lock. Revisit if this ever does go to Flathub.
+        - --share=network
+    build-commands:
+      - cargo build --release -p mixer-gui-iced
+      - install -Dm755 target/release/ferromix2 /app/bin/ferromix2
+      - install -Dm644 packaging/flatpak/io.github.zerodaylabz.FerroMix2.desktop
+        /app/share/applications/io.github.zerodaylabz.FerroMix2.desktop
+      - install -Dm644 assets/ferromix2.svg
+        /app/share/icons/hicolor/scalable/apps/io.github.zerodaylabz.FerroMix2.svg
+      - install -Dm644 packaging/flatpak/io.github.zerodaylabz.FerroMix2.metainfo.xml
+        /app/share/metainfo/io.github.zerodaylabz.FerroMix2.metainfo.xml
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - .git
+          - .idea
+          - ferromix_dump.txt

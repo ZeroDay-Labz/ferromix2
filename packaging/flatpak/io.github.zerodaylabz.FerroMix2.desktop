@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=FerroMix2
+Comment=Virtual audio mixer for PipeWire
+Exec=ferromix2
+Icon=io.github.zerodaylabz.FerroMix2
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;

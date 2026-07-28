@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.zerodaylabz.FerroMix2</id>
+  <name>FerroMix2</name>
+  <summary>Voicemeeter-style virtual audio mixer for PipeWire</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <developer_name>FerroMix contributors</developer_name>
+  <description>
+    <p>
+      FerroMix2 is a Voicemeeter-Potato-class virtual mixer for Linux, built
+      on PipeWire and WirePlumber. It routes any application to any hardware
+      output or virtual microphone, keeps routes alive by application name so
+      a call ending doesn't destroy your patch, refuses to build the feedback
+      loops that ruin a mix-minus setup, and runs per-strip noise-gate and
+      compressor DSP.
+    </p>
+    <p>
+      Launch it and it owns PipeWire for as long as it's open; close it and
+      every FerroMix device and link is torn down, PipeWire goes straight
+      back to stock behavior.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.zerodaylabz.FerroMix2.desktop</launchable>
+  <url type="homepage">https://github.com/ZeroDay-Labz/ferromix2</url>
+  <url type="bugtracker">https://github.com/ZeroDay-Labz/ferromix2/issues</url>
+  <provides>
+    <binary>ferromix2</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="3.0.0" date="2026-07-28">
+      <description>
+        <p>
+          Merged the daemon and GUI into a single process: launch it and it
+          owns PipeWire directly, close it and everything is torn down
+          cleanly. First Flatpak release.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>
