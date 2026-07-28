@@ -20,7 +20,7 @@
 # `--socket=pipewire` — it never starts a server of its own.
 id: io.github.zerodaylabz.FerroMix2
 runtime: org.freedesktop.Platform
-runtime-version: '23.08'
+runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
@@ -48,10 +48,15 @@ modules:
   - name: pipewire
     buildsystem: meson
     config-opts:
+      # Confirmed against a real build (pipewire 1.2.7's meson_options.txt):
+      # `installed-tests` and `pipewire-pulseaudio` are NOT valid option
+      # names for this release (meson fails fast, listing exactly which ones
+      # it doesn't recognize, which is how these two got caught) — pulseaudio
+      # compat is controlled by `-Dpipewire-alsa`/session modules, not a
+      # separate option, and there's no installed-tests toggle at all.
       - -Dsession-managers=[]
       - -Dpipewire-alsa=disabled
       - -Dpipewire-v4l2=disabled
-      - -Dpipewire-pulseaudio=disabled
       - -Dpipewire-jack=disabled
       - -Dgstreamer=disabled
       - -Dgstreamer-device-provider=disabled
@@ -64,7 +69,6 @@ modules:
       - -Dman=disabled
       - -Dtests=disabled
       - -Dexamples=disabled
-      - -Dinstalled-tests=disabled
       - -Dsystemd=disabled
       - -Dsystemd-system-service=disabled
       - -Dsystemd-user-service=disabled

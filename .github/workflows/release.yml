@@ -88,10 +88,17 @@ jobs:
     # go stale the way a hardcoded version number would.
     container: fedora:latest
     steps:
+      # git must exist BEFORE actions/checkout runs — without it, checkout
+      # silently falls back to downloading a plain file tree via the REST
+      # API instead of cloning, and the tree it leaves behind has no .git
+      # dir at all, which broke `git archive` below (confirmed live: "fatal:
+      # not a git repository").
+      - name: Install git
+        run: dnf install -y git
       - uses: actions/checkout@v4
-      - name: Install build dependencies
+      - name: Install remaining build dependencies
         run: |
-          dnf install -y rpm-build rpmdevtools git rust cargo clang-devel pkgconf-pkg-config pipewire-devel
+          dnf install -y rpm-build rpmdevtools rust cargo clang-devel pkgconf-pkg-config pipewire-devel
       - name: Build RPM
         env:
           VERSION: ${{ needs.version.outputs.version }}
@@ -129,9 +136,9 @@ jobs:
           sudo apt-get install -y flatpak flatpak-builder
           flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
           flatpak install --user -y flathub \
-            org.freedesktop.Platform//23.08 \
-            org.freedesktop.Sdk//23.08 \
-            org.freedesktop.Sdk.Extension.rust-stable//23.08
+            org.freedesktop.Platform//25.08 \
+            org.freedesktop.Sdk//25.08 \
+            org.freedesktop.Sdk.Extension.rust-stable//25.08
       - name: Build flatpak bundle
         env:
           VERSION: ${{ needs.version.outputs.version }}
