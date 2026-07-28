@@ -43,13 +43,25 @@ const MIN_WINDOW: (f32, f32) = (960.0, 600.0);
 /// GPU: wgpu picks an adapter, then panics importing a dmabuf for the window
 /// surface ("Fallback system failed to choose present mode. This is a bug.")
 /// — a wgpu/winit-level bug, not anything FerroMix's own code touches.
-/// Rather than expect every user on affected hardware to discover and set
-/// `WINIT_UNIX_BACKEND=x11` by hand, install a panic hook that relaunches
-/// this same binary once with XWayland forced if that happens, so it just
-/// works without the user ever seeing the crash. `FERROMIX_RELAUNCHED`
-/// guards against looping if the second attempt panics too (a genuine,
-/// unrelated bug shouldn't retry forever) — in that case it just crashes
-/// normally, same as before this existed.
+/// Rather than expect every user on affected hardware to discover a
+/// workaround by hand, install a panic hook that relaunches this same
+/// binary once with XWayland forced if that happens, so it just works
+/// without the user ever seeing the crash. `FERROMIX_RELAUNCHED` guards
+/// against looping if the second attempt panics too (a genuine, unrelated
+/// bug shouldn't retry forever) — in that case it just crashes normally,
+/// same as before this existed.
+///
+/// `WINIT_UNIX_BACKEND=x11` — the traditional way to force this — does
+/// NOT work on the winit version this app currently pulls in (0.30):
+/// confirmed both against its source (`platform_impl/linux/mod.rs`) and
+/// live (a first attempt at this fix set that var and the relaunched
+/// process still selected Wayland, crashed identically). winit 0.30 has no
+/// env-var override at all — it picks a backend purely from whether
+/// `WAYLAND_DISPLAY`/`WAYLAND_SOCKET` are set, Wayland taking priority
+/// whenever present. So instead of setting an env var, we strip the ones
+/// that make it choose Wayland in the first place — XWayland sessions
+/// still have `DISPLAY` set, which is what it falls back to once neither
+/// Wayland variable is present.
 fn install_xwayland_fallback() {
     if std::env::var_os("FERROMIX_RELAUNCHED").is_some() {
         return;
@@ -58,7 +70,8 @@ fn install_xwayland_fallback() {
         log::error!("panic during startup, retrying once under XWayland: {info}");
         let exe = std::env::current_exe().unwrap_or_else(|_| "ferromix2".into());
         let _ = std::process::Command::new(exe)
-            .env("WINIT_UNIX_BACKEND", "x11")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("WAYLAND_SOCKET")
             .env("FERROMIX_RELAUNCHED", "1")
             .spawn();
         std::process::exit(1);

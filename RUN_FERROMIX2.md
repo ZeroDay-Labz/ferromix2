@@ -10,8 +10,11 @@ separate project (won't collide with the old one).
 One process, one command — as of v3.0.0 the GUI owns PipeWire directly (see
 that changelog entry below), there's no separate daemon to start first.
 
-If the window doesn't appear on KDE Wayland:
-    WINIT_UNIX_BACKEND=x11 cargo run -p mixer-gui-iced
+If the window doesn't appear on Wayland (or crashes — see the v3.0.2
+changelog entry below, which now handles the crash case automatically):
+    WAYLAND_DISPLAY= WAYLAND_SOCKET= cargo run -p mixer-gui-iced
+(`WINIT_UNIX_BACKEND=x11` — the traditional fix — does NOT work on the
+winit version this app uses; see v3.0.2's entry for why.)
 
 ## New in v2.0.0
 - Renamed to FerroMix2 (socket: ferromix2.sock, config: ~/.config/ferromix2/)
@@ -239,3 +242,31 @@ routing correct).
   (cargo-deb defaults to the crate name) instead of `ferromix2_*.deb`.
 - Stopped shipping the RPM's auto-generated `-debuginfo`/`-debugsource`
   subpackages — clutter next to a single self-contained binary.
+
+## v3.0.2 — the actual XWayland fallback fix (v3.0.1's didn't work)
+
+v3.0.1's relaunch mechanism itself fired correctly (confirmed live in the
+same friend's log: panic caught, "retrying once under XWayland" logged,
+a second process started) — but the fix it applied did nothing: setting
+`WINIT_UNIX_BACKEND=x11` had no effect, the relaunched process still
+logged "Using Wayland platform" and crashed identically.
+
+Root cause: that env var is stale advice from a much older winit.
+Checked winit 0.30.13's actual source
+(`platform_impl/linux/mod.rs::EventLoop::new`) — it has no env-var
+override at all anymore. Backend selection is purely: if
+`WAYLAND_DISPLAY` or `WAYLAND_SOCKET` is set (and non-empty), use
+Wayland; else if `DISPLAY` is set, use X11. `WINIT_UNIX_BACKEND` isn't
+read anywhere in that path.
+
+- FIX: the relaunch now clears `WAYLAND_DISPLAY`/`WAYLAND_SOCKET` from
+  the child's environment instead of setting the dead env var — XWayland
+  sessions still have `DISPLAY` set, which winit falls back to once
+  neither Wayland variable is present. Verified the env-manipulation
+  logic in isolation (not just reasoned about) before wiring it back in,
+  same as v3.0.1's process — this time confirming the actual variables
+  winit's own source checks, not assuming a plausible-looking env var
+  still worked.
+- Updated README/RUN_FERROMIX2.md's manual-workaround instructions to
+  match (`WAYLAND_DISPLAY= WAYLAND_SOCKET= ferromix2`), since they
+  carried the same stale `WINIT_UNIX_BACKEND=x11` advice.

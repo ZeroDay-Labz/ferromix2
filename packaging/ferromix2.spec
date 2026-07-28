@@ -1,5 +1,5 @@
 Name:           ferromix2
-Version:        3.0.1
+Version:        3.0.2
 Release:        1%{?dist}
 Summary:        Voicemeeter-style virtual audio mixer for PipeWire
 
@@ -60,6 +60,13 @@ install -Dm644 assets/%{name}.svg %{buildroot}%{_datadir}/icons/hicolor/scalable
 %{_datadir}/icons/hicolor/scalable/apps/%{name}.svg
 
 %changelog
+* Tue Jul 28 2026 FerroMix contributors <noreply@example.com> - 3.0.2-1
+- FIX: v3.0.1's XWayland fallback relaunched correctly but didn't
+  actually change anything — it set WINIT_UNIX_BACKEND=x11, which the
+  windowing library (winit 0.30) doesn't read at all anymore. Confirmed
+  against winit's own source: it now only checks whether
+  WAYLAND_DISPLAY/WAYLAND_SOCKET are set. The relaunch now clears those
+  instead, which actually falls back to XWayland.
 * Tue Jul 28 2026 FerroMix contributors <noreply@example.com> - 3.0.1-1
 - FIX: native Wayland windowing could crash outright on hybrid-GPU laptops
   (confirmed live: NVIDIA discrete + Intel integrated, Fedora 44) — wgpu

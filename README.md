@@ -123,10 +123,17 @@ routes correctly either way; this just makes it proactive instead of reactive.
 
 **Window crashes on launch with `wgpu`/`EGL`/dmabuf errors** (seen on hybrid-
 GPU laptops — an NVIDIA discrete + Intel integrated GPU under native
-Wayland): fixed as of v3.0.1 — FerroMix now detects this at startup and
+Wayland): fixed as of v3.0.2 — FerroMix now detects this at startup and
 automatically relaunches itself once under XWayland, no action needed. If
-you're still on an older build, launch it with `WINIT_UNIX_BACKEND=x11`
-in the meantime.
+you're still on an older build, launch it with the two Wayland-selecting
+variables cleared so it falls back to XWayland on its own:
+```sh
+WAYLAND_DISPLAY= WAYLAND_SOCKET= ferromix2
+```
+(`WINIT_UNIX_BACKEND=x11`, the traditional fix for this class of issue,
+does **not** work on the windowing library version this app currently
+uses — it has no env-var override anymore, only this Wayland-variable
+fallback.)
 
 ## Config
 
