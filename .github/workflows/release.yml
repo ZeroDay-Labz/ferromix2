@@ -152,6 +152,12 @@ jobs:
       - name: Install flatpak-builder + runtimes
         run: |
           set -euo pipefail
+          # ubuntu-latest's default apt repos ship a flatpak too old to know
+          # about the `pipewire` socket type in finish-args (confirmed live:
+          # "Unknown socket type pipewire, valid types are: x11, wayland,
+          # pulseaudio, ..." — no pipewire in that list). The flatpak project's
+          # own PPA tracks current upstream releases.
+          sudo add-apt-repository -y ppa:flatpak/stable
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder
           flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
