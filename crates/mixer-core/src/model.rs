@@ -308,7 +308,18 @@ pub struct MixerState {
     /// header's LIVE/OFF indicator independent of `connected` (the socket
     /// can be fine while FerroMix is deliberately not routing anything).
     pub enabled: bool,
+    /// False once the backend's connection to PipeWire has died (see
+    /// `BackendEvent::Disconnected`) — the engine is still running, but
+    /// nothing it does reaches real audio until the GUI rebuilds the
+    /// backend. Defaults true; only ever set false at runtime, never
+    /// persisted (a fresh process/backend always starts alive).
+    #[serde(default = "default_true")]
+    pub backend_alive: bool,
     pub log: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl MixerState {

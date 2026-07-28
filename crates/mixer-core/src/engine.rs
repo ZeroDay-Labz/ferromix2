@@ -215,7 +215,28 @@ fn initial_state(cfg: &Config) -> MixerState {
         ui_scale: cfg.ui_scale,
         sample_rate: cfg.sample_rate,
         enabled: cfg.enabled,
+        backend_alive: true,
         log: Vec::new(),
+    }
+}
+
+/// Build a `Command` for a host system-service action (`systemctl`, etc.).
+/// Under Flatpak, a sandboxed process can't reach the host's systemd/D-Bus
+/// directly — `/.flatpak-info` existing is the standard way to detect
+/// running inside a Flatpak sandbox, and `flatpak-spawn --host` is the
+/// standard way to run a command on the host from inside one (needs the
+/// `--talk-name=org.freedesktop.Flatpak` finish-arg — see
+/// `packaging/flatpak/*.yml`). Outside a sandbox this is just
+/// `Command::new(program)`, unchanged. `pw-metadata`/`pw-cli` (used by
+/// `apply_sample_rate_metadata` below) don't need this — they're PipeWire
+/// clients talking over `--socket=pipewire`, not host services.
+pub fn host_command(program: &str) -> std::process::Command {
+    if std::path::Path::new("/.flatpak-info").exists() {
+        let mut cmd = std::process::Command::new("flatpak-spawn");
+        cmd.arg("--host").arg(program);
+        cmd
+    } else {
+        std::process::Command::new(program)
     }
 }
 
@@ -223,7 +244,7 @@ fn initial_state(cfg: &Config) -> MixerState {
 /// offers, so switching between them never needs this again) and
 /// `clock.force-rate` to PipeWire's "settings" metadata object — the two
 /// writes `Command::SetSampleRate`'s handler needs, factored out so both the
-/// live command handler and daemon startup (below) can re-assert a
+/// live command handler and engine startup (below) can re-assert a
 /// persisted non-default rate without duplicating the exact `pw-metadata`
 /// invocations. See `Command::SetSampleRate`'s doc comment for why this
 /// shells out rather than going through `AudioBackend`.
@@ -480,6 +501,10 @@ fn run(
                     st.feedback = pairs;
                 }
                 BackendEvent::Log(l) => st.push_log(format!("{} {l}", ts())),
+                BackendEvent::Disconnected(reason) => {
+                    st.backend_alive = false;
+                    st.push_log(format!("{} ⚠ lost PipeWire connection: {reason}", ts()));
+                }
                 BackendEvent::RecordStopped(t) => match t {
                     RecTarget::Bus(i) => {
                         if let Some(b) = st.buses.get_mut(i) {
@@ -754,10 +779,10 @@ fn run(
                     // comes up already forced to the new rate instead of
                     // silently reverting to pipewire.conf's stock default.
                     apply_sample_rate_metadata(rate);
-                    let _ = std::process::Command::new("systemctl")
+                    let _ = host_command("systemctl")
                         .args(["--user", "restart", "pipewire.socket", "pipewire-pulse.socket"])
                         .spawn();
-                    let _ = std::process::Command::new("systemctl")
+                    let _ = host_command("systemctl")
                         .args(["--user", "restart", "wireplumber.service"])
                         .spawn();
                     std::thread::spawn(move || {

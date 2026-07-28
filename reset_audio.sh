@@ -9,7 +9,6 @@
 set -e
 
 echo "Stopping FerroMix (if running)..."
-pkill -f 'target/(debug|release)/ferromix2-daemon' 2>/dev/null || true
 pkill -f 'target/(debug|release)/ferromix2$' 2>/dev/null || true
 sleep 1
 

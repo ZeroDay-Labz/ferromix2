@@ -21,6 +21,13 @@ pub enum BackendEvent {
     Feedback(Vec<(usize, usize)>),
     Log(String),
     RecordStopped(RecTarget),
+    /// The backend's connection to the audio server died (e.g. PipeWire
+    /// itself was restarted, deliberately via the RESET AUDIO button /
+    /// `Command::SetSampleRate`, or externally). The engine keeps running —
+    /// further commands just no-op against the dead backend — and the GUI
+    /// is responsible for rebuilding the backend from scratch; see
+    /// `MixerState.backend_alive`.
+    Disconnected(String),
 }
 
 pub type BackendResult = Result<(), String>;

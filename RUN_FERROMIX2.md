@@ -5,11 +5,10 @@ separate project (won't collide with the old one).
 
 ## Run
 
-Terminal 1 — daemon (owns audio):
-    cargo run -p mixer-daemon        # binary: ferromix2-daemon
-
-Terminal 2 — Iced GUI:
     cargo run -p mixer-gui-iced      # binary: ferromix2
+
+One process, one command — as of v3.0.0 the GUI owns PipeWire directly (see
+that changelog entry below), there's no separate daemon to start first.
 
 If the window doesn't appear on KDE Wayland:
     WINIT_UNIX_BACKEND=x11 cargo run -p mixer-gui-iced
@@ -193,3 +192,27 @@ were correct.
 - Lesson learned, and applied going forward: `pw-dump`/`pw-link` showing a
   link exists is NOT sufficient verification — it doesn't show whether a
   COMPETING link also exists. Verification now checks exclusivity.
+
+## v3.0.0 — daemon/GUI merge: one process, one launch
+
+The `ferromix2-daemon` + `ferromix2` split only ever existed to test the GUI
+against a running daemon independently. The actual goal is simpler than what
+that split implied: one app, one launch, and closing it returns PipeWire to
+completely stock behavior. So the daemon is gone — `ferromix2` now boots
+`mixer-core::Engine` directly on the real PipeWire backend in-process
+(`crates/mixer-gui-iced/src/link.rs`), the same call the daemon's `main()`
+used to make. No socket, no systemd --user service, nothing left running
+after the window closes (FerroMix's virtual devices were already never
+`object.linger`'d, so process exit was always a clean teardown — there just
+used to be a second process staying alive on purpose).
+
+- Removed `mixer-daemon` and `mixer-core::ipc` (the Unix-socket/bincode
+  protocol) entirely — nothing to keep in sync between two binaries anymore.
+- The pending fix for a dead PipeWire connection (previously: exit the
+  process so systemd restarts it) now instead sends
+  `BackendEvent::Disconnected`, stops just the worker thread, and lets the
+  GUI rebuild a fresh backend + engine in place after a short delay — a
+  RESET AUDIO click or a sample-rate change (both of which restart PipeWire
+  on purpose) no longer takes the whole window down with it. Shows briefly
+  as "reconnecting…" in the header.
+- Packaging follows: RPM/PKGBUILD ship one binary, no `.service` unit.

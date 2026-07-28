@@ -15,3 +15,6 @@ mixer-core = { path = "../mixer-core" }
 iced = { version = "0.13", features = ["canvas", "svg", "tokio", "advanced"] }
 log = { workspace = true }
 env_logger = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+mixer-pw = { path = "../mixer-pw" }

@@ -1,5 +1,5 @@
 Name:           ferromix2
-Version:        2.7.0
+Version:        3.0.0
 Release:        1%{?dist}
 Summary:        Voicemeeter-style virtual audio mixer for PipeWire
 
@@ -13,7 +13,6 @@ BuildRequires:  cargo
 BuildRequires:  clang-devel
 BuildRequires:  pkgconf-pkg-config
 BuildRequires:  pipewire-devel
-BuildRequires:  systemd-rpm-macros
 
 Requires:       pipewire
 Requires:       wireplumber
@@ -29,9 +28,10 @@ microphone, keeps routes alive by app name (a call ending doesn't destroy your
 patch), refuses to build the feedback loops that ruin a mix-minus setup, and
 runs per-strip noise-gate/compressor DSP.
 
-This package installs the daemon (%{name}-daemon, owns the PipeWire graph and
-runs as a systemd --user service) and the Iced-based GUI (%{name}, a disposable
-IPC client — closing it never interrupts audio). Also ships (but does NOT
+This package installs a single binary (%{name}) — launch it and it owns the
+PipeWire graph for as long as it's open; close it and every FerroMix device/
+link is torn down, PipeWire goes straight back to stock behavior. No service
+to enable, nothing left running in the background. Also ships (but does NOT
 apply automatically — see %doc) an optional WirePlumber override that
 disables Fedora's role-based loopback routing, which otherwise races
 FerroMix for control of PipeWire-pulse clients like Spotify and Firefox.
@@ -43,38 +43,34 @@ FerroMix for control of PipeWire-pulse clients like Spotify and Firefox.
 cargo build --release --locked
 
 %install
-install -Dm755 target/release/%{name}-daemon %{buildroot}%{_bindir}/%{name}-daemon
 install -Dm755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
-install -Dm644 packaging/%{name}.service %{buildroot}%{_userunitdir}/%{name}.service
 install -Dm644 assets/%{name}.desktop %{buildroot}%{_datadir}/applications/%{name}.desktop
 install -Dm644 assets/%{name}.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/%{name}.svg
-
-# The daemon also self-launches on demand (the GUI spawns it if it isn't
-# already running — see crates/mixer-gui-iced/src/link.rs's
-# try_launch_daemon), so a user who never enables the systemd --user service
-# still gets a working single-click launch from the desktop entry. Enabling
-# the service here is still worth doing where the packaging macros support
-# it: it means the daemon comes up at login (not just on first GUI launch)
-# and survives independently of any one GUI window.
-%post
-%systemd_user_post %{name}.service
-
-%preun
-%systemd_user_preun %{name}.service
-
-%postun
-%systemd_user_postun_with_restart %{name}.service
 
 %files
 %license LICENSE
 %doc packaging/wireplumber/91-ferromix-disable-role-loopbacks.conf
-%{_bindir}/%{name}-daemon
 %{_bindir}/%{name}
-%{_userunitdir}/%{name}.service
 %{_datadir}/applications/%{name}.desktop
 %{_datadir}/icons/hicolor/scalable/apps/%{name}.svg
 
 %changelog
+* Tue Jul 28 2026 FerroMix contributors <noreply@example.com> - 3.0.0-1
+- BREAKING: merged the daemon and GUI into a single process. There is no
+  more `%{name}-daemon` binary and no more systemd --user service — launch
+  %{name} and it owns PipeWire directly for as long as it's open; close the
+  window and every FerroMix node/link is torn down, no lingering state, no
+  background service. If you have the old %{name}.service enabled, disable
+  it after upgrading (`systemctl --user disable --now %{name}.service`) —
+  it's no longer installed by this package and referencing a stale unit
+  file will otherwise just fail quietly on next login.
+- Fixed a real bug the old split surfaced: a PipeWire restart (RESET AUDIO,
+  a sample-rate change, or an external `systemctl restart pipewire`) used
+  to leave the daemon's connection dead with no way to notice — confirmed
+  live, it reported healthy for over two hours while every fader/mute/
+  route silently did nothing. The single process now detects this and
+  reconnects itself automatically, visible as a brief "reconnecting…" in
+  the header.
 * Wed Jul 22 2026 FerroMix contributors <noreply@example.com> - 2.7.0-1
 - GUI now launches the daemon itself if it isn't already running (checks
   with pgrep first to avoid a double-launch race), so the desktop entry is

@@ -1,6 +1,9 @@
-//! FerroMix — Iced console. A pure client of the FerroMix daemon: it renders
-//! the mixer state it polls over the Unix socket and sends `Command`s back. No
-//! PipeWire here, so the audio engine is never at risk while the UI evolves.
+//! FerroMix — Iced console. Owns the audio engine directly (`link::start`
+//! boots `mixer_core::Engine` on the real PipeWire backend in-process) but
+//! only ever talks to it through `EngineHandle`'s `Command`/`MixerState`
+//! seam, same as if it were still a separate process — no PipeWire calls in
+//! this crate itself, so the UI can keep evolving without risking the audio
+//! engine.
 
 mod icons;
 mod link;
@@ -10,14 +13,17 @@ mod widgets;
 
 use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Element, Length, Subscription, Task};
-use mixer_core::engine::Command;
+use mixer_core::engine::{Command, EngineHandle};
 use mixer_core::model::{BusKind, MixerState};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// How long to wait after the last change before autosaving.
 const AUTOSAVE_DEBOUNCE: Duration = Duration::from_millis(1500);
+
+/// How long to show "reconnecting…" before actually rebuilding the backend —
+/// gives a dropped PipeWire connection (e.g. mid-restart from RESET AUDIO or
+/// a sample-rate change) a moment to settle before we reconnect into it.
+const RECONNECT_DELAY: Duration = Duration::from_millis(1200);
 
 /// How long the amber "you're interacting with this stack" outline stays lit
 /// after the last command sent for that strip/bus — a drag holds it on
@@ -58,11 +64,6 @@ fn main() -> iced::Result {
         .run_with(App::new)
 }
 
-/// The link worker handles are global because Iced's subscription needs to read
-/// the receiver from a plain function; a Mutex keeps it simple and safe.
-static LINK_RX: Mutex<Option<Receiver<link::FromLink>>> = Mutex::new(None);
-static LINK_TX: Mutex<Option<Sender<link::ToLink>>> = Mutex::new(None);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Console,
@@ -82,9 +83,18 @@ pub enum RenameTarget {
 }
 
 struct App {
+    /// `None` only if the initial PipeWire connection failed outright (see
+    /// `link::start`'s error path) — otherwise always `Some`, rebuilt in place
+    /// by `Message::Tick` if the backend ever reports itself disconnected.
+    engine: Option<EngineHandle>,
     state: Option<MixerState>,
-    connected: bool,
     status: String,
+    /// Set the moment the backend is first noticed to be down (engine absent,
+    /// or `state.backend_alive == false`); cleared the moment it's healthy
+    /// again. `Message::Tick` uses this to wait `RECONNECT_DELAY` before
+    /// actually rebuilding the backend, and to retry on that same cadence if
+    /// the rebuild itself fails.
+    disconnected_since: Option<Instant>,
     tab: Tab,
     /// True when a command has been sent since the last successful save.
     dirty: bool,
@@ -172,7 +182,6 @@ fn wrap_cards<'a>(cards: Vec<Element<'a, Message>>, per_row: usize, gap: f32) ->
 
 #[derive(Debug, Clone)]
 enum Message {
-    Link(link::FromLink),
     Tab(Tab),
     Send(Command),
     WindowResized(f32),
@@ -193,14 +202,19 @@ enum Message {
 
 impl App {
     fn new() -> (Self, Task<Message>) {
-        let (tx, rx) = link::spawn();
-        *LINK_TX.lock().unwrap() = Some(tx);
-        *LINK_RX.lock().unwrap() = Some(rx);
+        let (engine, status, disconnected_since) = match link::start() {
+            Ok(e) => (Some(e), "starting…".to_string(), None),
+            // Seed `disconnected_since` too, not just `engine: None` — otherwise
+            // the first `Message::Tick` (16ms later) immediately overwrites this
+            // error text with a generic "reconnecting…" before anyone sees it.
+            Err(e) => (None, format!("PipeWire error: {e}"), Some(Instant::now())),
+        };
         (
             App {
+                engine,
                 state: None,
-                connected: false,
-                status: "connecting to daemon…".into(),
+                status,
+                disconnected_since,
                 tab: Tab::Console,
                 dirty: false,
                 last_change: None,
@@ -214,27 +228,13 @@ impl App {
     }
 
     fn send(&self, cmd: Command) {
-        if let Some(tx) = LINK_TX.lock().unwrap().as_ref() {
-            let _ = tx.send(link::ToLink::Cmd(cmd));
+        if let Some(engine) = &self.engine {
+            engine.send(cmd);
         }
     }
 
     fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
-            Message::Link(ev) => match ev {
-                link::FromLink::Connected => {
-                    self.connected = true;
-                    self.status = "LIVE".into();
-                }
-                link::FromLink::State(s) => {
-                    self.connected = true;
-                    self.state = Some(*s);
-                }
-                link::FromLink::Disconnected(e) => {
-                    self.connected = false;
-                    self.status = format!("daemon offline — {e}");
-                }
-            },
             Message::Tab(t) => self.tab = t,
             Message::WindowResized(w) => self.window_width = w,
             Message::RenameStart(target, current) => self.renaming = Some((target, current)),
@@ -307,18 +307,58 @@ impl App {
             }
             Message::ResetAudio => {
                 self.status = "resetting PipeWire/WirePlumber…".into();
-                // Fire-and-forget: restarting these services drops the
-                // daemon's PipeWire connection, which the existing
-                // reconnect-on-drop logic in `link.rs` already handles —
-                // no need to wait for or track completion here.
-                let _ = std::process::Command::new("systemctl")
+                // Fire-and-forget: restarting these services drops our own
+                // PipeWire connection, which `Message::Tick`'s reconnect
+                // logic below already handles — no need to wait for or
+                // track completion here. `host_command` routes this through
+                // `flatpak-spawn --host` under Flatpak, where a sandboxed
+                // process can't reach the host's systemd directly.
+                let _ = mixer_core::engine::host_command("systemctl")
                     .args(["--user", "restart", "pipewire.socket", "pipewire-pulse.socket"])
                     .spawn();
-                let _ = std::process::Command::new("systemctl")
+                let _ = mixer_core::engine::host_command("systemctl")
                     .args(["--user", "restart", "wireplumber.service"])
                     .spawn();
             }
             Message::Tick => {
+                // Poll the engine's state directly — in-process now, so this
+                // is just a mutex lock + clone, no socket round-trip. `broken`
+                // covers both "never connected" (startup failure) and "was
+                // connected, backend just died" (e.g. RESET AUDIO / a
+                // sample-rate change restarting PipeWire out from under us).
+                let broken = match &self.engine {
+                    None => true,
+                    Some(engine) => {
+                        let snapshot = engine.snapshot();
+                        let alive = snapshot.backend_alive;
+                        self.state = Some(snapshot);
+                        !alive
+                    }
+                };
+                if broken {
+                    match self.disconnected_since {
+                        None => {
+                            self.disconnected_since = Some(Instant::now());
+                            self.status = "reconnecting…".into();
+                        }
+                        Some(since) if since.elapsed() > RECONNECT_DELAY => match link::start() {
+                            Ok(engine) => {
+                                self.state = Some(engine.snapshot());
+                                self.engine = Some(engine);
+                                self.disconnected_since = None;
+                                self.status = "LIVE".into();
+                            }
+                            Err(e) => {
+                                self.status = format!("PipeWire error: {e} — retrying…");
+                                self.disconnected_since = Some(Instant::now());
+                            }
+                        },
+                        Some(_) => {}
+                    }
+                } else {
+                    self.disconnected_since = None;
+                }
+
                 if self.dirty {
                     if let Some(t) = self.last_change {
                         if t.elapsed() > AUTOSAVE_DEBOUNCE {
@@ -338,22 +378,10 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        // Drain the link worker's channel on a timer and feed events in.
-        // 16ms (~60Hz) rather than the old 33ms (~30Hz) — snappier meters.
-        // Matched by link.rs's own poll interval below; no point draining
-        // faster than fresh state actually arrives. This is a polling
-        // architecture, so there's a real latency floor here (~one poll
-        // interval, now ~16ms instead of ~33ms) — not literally zero, but
-        // beyond typical human perception for a VU meter.
-        let poll = iced::time::every(std::time::Duration::from_millis(16)).map(|_| {
-            let mut guard = LINK_RX.lock().unwrap();
-            if let Some(rx) = guard.as_ref() {
-                if let Ok(ev) = rx.try_recv() {
-                    return Message::Link(ev);
-                }
-            }
-            Message::Tick
-        });
+        // 16ms (~60Hz) tick drives both the state poll (see `Message::Tick`)
+        // and the autosave/active-highlight timers — snappier meters than
+        // the old 33ms (~30Hz) IPC-poll cadence.
+        let poll = iced::time::every(std::time::Duration::from_millis(16)).map(|_| Message::Tick);
         let resize = iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size.width));
         // Escape aborts an in-progress rename without submitting it —
         // `RenameCancel` existed as dead code (a variant with a working
@@ -408,7 +436,7 @@ impl App {
         let logo = row![
             text("FERRO").size(tokens::type_scale::DISPLAY).color(theme::TEXT),
             text("MIX").size(tokens::type_scale::DISPLAY).color(theme::ACCENT),
-            text("2  v2.6").size(tokens::type_scale::BODY).color(theme::TEXT_DIM),
+            text(concat!("2  v", env!("CARGO_PKG_VERSION"))).size(tokens::type_scale::BODY).color(theme::TEXT_DIM),
         ]
         .align_y(iced::Alignment::Center);
 
@@ -423,12 +451,14 @@ impl App {
         // `enabled` defaults true while state hasn't loaded yet, so the
         // indicator doesn't flash OFF for a moment on every launch.
         let enabled = self.state.as_ref().map(|s| s.enabled).unwrap_or(true);
-        let status = if !self.connected {
-            // Real backend failure — unchanged from before, takes priority
-            // over the enabled/disabled read since the daemon might not
-            // even be reachable to report its enabled state accurately.
+        // Set by `Message::Tick` the moment the backend is noticed down
+        // (never connected, or `MixerState.backend_alive` went false) and
+        // cleared the moment a rebuilt backend reports itself alive again —
+        // takes priority over the enabled/disabled read since the backend
+        // might not even be up to report its enabled state accurately.
+        let status = if self.disconnected_since.is_some() {
             row![
-                icons::icon(icons::Icon::Dot, 10.0, theme::REC_RED),
+                icons::icon(icons::Icon::Dot, 10.0, theme::MIC_AMBER),
                 Space::with_width(4),
                 text(self.status.clone()).size(tokens::type_scale::BODY).color(theme::TEXT_DIM),
             ]

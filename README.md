@@ -4,6 +4,11 @@
 or virtual mic, keeps routes alive by name (a VoIP call ending doesn't destroy
 your patch), and refuses to build the feedback loops that ruin a mix-minus.
 
+One binary, one launch: open it and it owns PipeWire for as long as it's
+running; close it and every FerroMix device/link is torn down, PipeWire goes
+straight back to stock behavior. Nothing to enable, nothing left running in
+the background.
+
 Built because the alternatives don't cut it: qpwgraph makes you redraw a line
 every time a call ends; Pulsemeeter lumps everything into two virtual inputs
 and looks like 2009.
@@ -40,24 +45,32 @@ lands on the "Virtual Input" strip — one fader for all your loose system audio
 
 ### Routes stick
 
-Assignments are keyed by **app name**, never by PipeWire ids. End a call, close
-an app, restart the daemon — when it comes back, the reconciler re-links it.
+Assignments are keyed by **app name**, never by PipeWire ids. End a call,
+close an app, restart FerroMix itself — when it (or the app) comes back, the
+reconciler re-links it.
 The strip stays visible (marked offline) so your intent is never lost.
 
 ## Upgrading from an earlier build — read this
 
-Versions before 0.5 created their virtual devices with `object.linger`, so the
-devices **outlived the daemon** and every run left another copy behind
-(`FerroMix A1`, `FerroMix A1-1`, …). Links landed on one copy while meters
-watched another. v0.5 no longer lingers, and **sweeps any leftover `ferromix.*`
-node at startup** — so it self-heals. Also delete your old config, since the
-bus list and default gain changed:
+**v3.0.0 merged the daemon into the GUI.** There is no more `ferromix2-daemon`
+binary and no more `ferromix2.service`. If you had the old service enabled:
 
 ```sh
-rm -f ~/.config/ferromix/config.toml
-systemctl --user restart ferromix
-pw-cli ls Node | grep -i ferromix    # expect ONE node per bus, no "-1" copies
+systemctl --user disable --now ferromix2.service
+rm -f ~/.config/systemd/user/ferromix2.service
+systemctl --user daemon-reload
 ```
+
+Your `~/.config/ferromix2/config.toml` (routing, faders, DSP) is untouched
+and still applies — just launch `ferromix2` itself from now on.
+
+Separately: versions before 0.5 created their virtual devices with
+`object.linger`, so the devices outlived the daemon and every run left
+another copy behind (`FerroMix A1`, `FerroMix A1-1`, …). That's long gone —
+devices now die with the process (and always did the reconnect-safe way,
+sweeping any leftover `ferromix.*` node at startup) — noted here only because
+it's the reason process exit was always a safe, complete teardown even before
+v3.0.0 made that the *whole* app's behavior, not just the daemon's.
 
 ## Fedora
 
@@ -66,21 +79,17 @@ sudo dnf install rust cargo clang-devel pkgconf-pkg-config pipewire-devel ladspa
 cargo build --release
 
 # install
-sudo install -Dm755 target/release/ferromix2-daemon /usr/bin/
-sudo install -Dm755 target/release/ferromix2        /usr/bin/
-install -Dm644 packaging/ferromix2.service ~/.config/systemd/user/ferromix2.service
-systemctl --user daemon-reload
-systemctl --user enable --now ferromix2
+sudo install -Dm755 target/release/ferromix2 /usr/bin/
 
-ferromix2            # badge reads LIVE when it's talking to the daemon
+ferromix2            # badge reads LIVE the moment it's connected to PipeWire
 ```
 
-Check it's alive:
+That's it — no service to enable. Check it's alive:
 ```sh
-systemctl --user status ferromix2
-journalctl --user -u ferromix2 -f      # live log
 pw-cli ls Node | grep -i ferromix      # your buses + virtual input
 ```
+(or just watch the header: green dot + LIVE means it's routing; the LOG tab
+in the app itself shows the same live log a `journalctl -f` used to.)
 
 Then in each app: point **Discord's input** at `FerroMix B1`, your **softphone's
 input** at `FerroMix B2`, and pick a real device for A1 in the GUI.
@@ -134,13 +143,13 @@ assign = ["A1", "B2"]    # buses this strip feeds
 
 ## Architecture
 
-`mixer-core` (model/engine/config/IPC/mock) · `mixer-pw` (PipeWire: devices,
-declarative link reconciler, VU taps, recorder, per-strip DSP) · `mixer-daemon`
-(`ferromix2-daemon`, owns the graph, serves GUIs over a Unix socket) ·
-`mixer-gui-iced` (`ferromix2`, Iced console + matrix + settings + log).
+`mixer-core` (model/engine/config/mock) · `mixer-pw` (PipeWire: devices,
+declarative link reconciler, VU taps, recorder, per-strip DSP) ·
+`mixer-gui-iced` (`ferromix2`, the single binary — Iced console + matrix +
+settings + log, owning the PipeWire worker thread directly).
 
-The daemon owns audio; the GUI is disposable. Close it, audio keeps flowing.
-See `docs/ARCHITECTURE.md`.
+One process. Launch it and it owns PipeWire; close it and every FerroMix
+device/link is torn down, no lingering state. See `docs/ARCHITECTURE.md`.
 
 ## License
 

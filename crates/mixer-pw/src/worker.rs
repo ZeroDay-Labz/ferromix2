@@ -337,6 +337,41 @@ pub(crate) fn run(cmd_rx: pw::channel::Receiver<PwCmd>, ev_tx: Sender<BackendEve
                 ctx.log("initial graph sync complete");
             }
         })
+        // `id == PW_ID_CORE` (0) is the connection itself reporting an error —
+        // in practice this is how a client learns the server it's connected
+        // to is gone (e.g. `systemctl restart pipewire.socket`, which
+        // `Command::SetSampleRate` and the GUI's RESET AUDIO button both
+        // already do deliberately). Without this handler the process kept
+        // running with a permanently dead `pw::core::CoreRc` — `mainloop.run()`
+        // never returns, so nothing else in this file notices — while every
+        // one of its strip/bus nodes had already vanished with the old
+        // server, silently turning every fader/mute/route into a no-op
+        // forever (confirmed live: the daemon reported healthy to `pgrep`
+        // for over two hours after a PipeWire restart it never detected).
+        //
+        // FerroMix is a single process now (GUI + this worker thread), not a
+        // daemon a service supervisor restarts — exiting the process here
+        // would take the whole window down every time PipeWire restarts,
+        // including the deliberate cases above. Instead: tell the mainloop to
+        // stop (so `run()` below returns and this thread ends, dropping the
+        // dead core/context/registry) and notify the engine via
+        // `BackendEvent::Disconnected`. The GUI (the only thing that outlives
+        // this thread) is responsible for rebuilding a fresh `PwBackend` +
+        // `Engine` after a short delay — see `link::start`/`Message::Tick` in
+        // `mixer-gui-iced`.
+        .error({
+            let ctx = ctx.clone();
+            let mainloop = mainloop.clone();
+            move |id, _seq, res, message| {
+                if id == 0 {
+                    log::error!("core connection error (res={res}): {message} — disconnecting so the GUI can reconnect");
+                    let _ = ctx.ev_tx.send(BackendEvent::Disconnected(message.to_string()));
+                    mainloop.quit();
+                } else {
+                    let _ = ctx.ev_tx.send(BackendEvent::Log(format!("pipewire object {id} error: {message}")));
+                }
+            }
+        })
         .register();
     let _ = ctx.core.sync(0);
 
