@@ -41,6 +41,19 @@
 //! strip — an acceptable trade for not needing to discover/bind the internal
 //! `gate_l`/`gate_r`/`comp` nodes the module creates, which would need
 //! reverse-engineering filter-chain's internal naming convention.
+//!
+//! Future direction (not built yet): the fixed gate→compressor chain here is
+//! a special case of a more general capability — `filter.graph`'s `nodes`
+//! list can hold ANY `ladspa`/(newer PipeWire) `lv2` plugin, not just
+//! `sc4`, the same mechanism a live pitch-shifter or other real-time effect
+//! insert would use. Getting there needs `StripDsp` to become a plugin
+//! chain (a `Vec` of {plugin, params}) instead of two hardcoded stages, plus
+//! a way to enumerate installed LV2/LADSPA plugins and their real port
+//! names/ranges for the GUI (this file's whole hard-won port-name/threshold-
+//! units history above is exactly the class of bug that needs solving generically
+//! instead of once per plugin). Deliberately not designed further than this
+//! paragraph until there's a second concrete plugin to design against, not
+//! just the gate/compressor.
 use std::ffi::CString;
 use std::ptr::NonNull;
 

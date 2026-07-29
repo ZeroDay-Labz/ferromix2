@@ -259,6 +259,9 @@ impl AudioBackend for MockBackend {
         self.shared.lock().unwrap().strip_faders.entry(idx).or_insert((1.0, false)).1 = mute;
         Ok(())
     }
+    fn set_strip_solo(&mut self, _idx: usize, _solo: bool) -> BackendResult {
+        Ok(())
+    }
     fn set_strip_assign(&mut self, idx: usize, bus_idx: usize, on: bool) -> BackendResult {
         let mut sh = self.shared.lock().unwrap();
         if on {

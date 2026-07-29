@@ -28,6 +28,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       is_release: ${{ steps.v.outputs.is_release }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
       - id: v
@@ -47,6 +48,16 @@ jobs:
             if [[ -z "$VERSION" ]]; then VERSION="$CARGO_VERSION"; fi
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Still genuinely alpha-quality software — any -alpha/-beta/-rc
+          # suffix marks the GitHub Release as a Pre-release instead of
+          # "Latest", so that's honestly signaled to anyone who finds the
+          # repo. A future stable tag (no suffix) reverts to a normal
+          # release automatically, no workflow edit needed.
+          if [[ "$CARGO_VERSION" =~ -(alpha|beta|rc) ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
           fi
 
   tarball:
@@ -128,7 +139,13 @@ jobs:
           # user expects to own the tree; without this git refuses to touch it.
           git config --global --add safe.directory "$PWD"
           rpmdev-setuptree
-          git archive --prefix="ferromix2-${VERSION}/" -o "$HOME/rpmbuild/SOURCES/ferromix2-${VERSION}.tar.gz" HEAD
+          # RPM's Version: can't contain a hyphen — the spec's own Version is
+          # the bare "3.1.0" part (see its header comment), so the source
+          # tarball this Source0 line expects has to be named after THAT, not
+          # the full "3.1.0-alpha.1" $VERSION every other job uses for its
+          # own artifact filenames.
+          RPM_VERSION="${VERSION%%-*}"
+          git archive --prefix="ferromix2-${RPM_VERSION}/" -o "$HOME/rpmbuild/SOURCES/ferromix2-${RPM_VERSION}.tar.gz" HEAD
           cp packaging/ferromix2.spec "$HOME/rpmbuild/SPECS/ferromix2.spec"
           rpmbuild -ba "$HOME/rpmbuild/SPECS/ferromix2.spec"
           mkdir -p dist
@@ -199,6 +216,7 @@ jobs:
           # exist — don't fail the whole release over a glob with no match.
           fail_on_unmatched_files: false
           generate_release_notes: true
+          prerelease: ${{ needs.version.outputs.prerelease }}
           files: |
             dist/tarball/*.tar.gz
             dist/deb/*.deb

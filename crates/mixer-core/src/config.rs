@@ -84,6 +84,13 @@ pub struct Config {
     /// per-node.
     #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
+    /// PipeWire's forced graph quantum (`clock.force-quantum`, in samples) —
+    /// the Linux equivalent of an ASIO buffer size. `0` = auto/unforced
+    /// (PipeWire's own default). Applied the same way `sample_rate` is: a
+    /// system-wide `pw-metadata` write, not a per-node property, since
+    /// quantum is a property of the graph's clock, not of any one node.
+    #[serde(default)]
+    pub quantum: u32,
     /// Master bypass. When `false`, FerroMix releases every app it's
     /// redirected (hands `target.object` back to WirePlumber's own default
     /// policy) and stops reconciling — your system behaves like stock
@@ -131,6 +138,7 @@ impl Default for Config {
             ui_scale: 0.0, // auto
             enabled: true,
             sample_rate: 48_000,
+            quantum: 0, // auto
             buses: vec![
                 BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), strip_feeds: Vec::new(), input: None, listener: None, label: "A1".into(), kind: "hw".into(), device: None, volume: crate::model::UNITY_POS, mute: false },
                 BusCfg { name: String::new(), monitor: Vec::new(), feeds: Vec::new(), strip_feeds: Vec::new(), input: None, listener: None, label: "A2".into(), kind: "hw".into(), device: None, volume: crate::model::UNITY_POS, mute: false },

@@ -1,6 +1,12 @@
 Name:           ferromix2
-Version:        3.0.2
-Release:        1%{?dist}
+# RPM's Version: field can't contain a hyphen, so a semver prerelease
+# (3.1.0-alpha.1) splits across Version/Release the standard Fedora way: the
+# bare version here, and a "0."-prefixed Release that sorts BEFORE the
+# eventual 1%{?dist} stable release of the same Version. Source0/the CI job
+# that builds this (.github/workflows/release.yml's `rpm` job) both derive
+# the same split from the git tag — keep them in sync if this changes.
+Version:        3.1.0
+Release:        0.1.alpha1%{?dist}
 Summary:        Voicemeeter-style virtual audio mixer for PipeWire
 
 License:        MIT
@@ -60,6 +66,20 @@ install -Dm644 assets/%{name}.svg %{buildroot}%{_datadir}/icons/hicolor/scalable
 %{_datadir}/icons/hicolor/scalable/apps/%{name}.svg
 
 %changelog
+* Wed Jul 29 2026 FerroMix contributors <noreply@example.com> - 3.1.0-0.1.alpha1
+- First alpha-tagged release (still genuinely alpha-quality software —
+  GitHub Release is marked pre-release accordingly).
+- Added SOLO: PFL solo per strip, scoped to hardware-out sends only —
+  never a B-bus, since that feeds another application's mic and must
+  never go silent just because you soloed a strip for your own
+  monitoring. Mute always wins over solo.
+- Added a global PANIC/mute-all (Matrix tab and Settings), a real
+  buffer/quantum picker in Settings (replacing a copy-paste terminal
+  command), and a config export/backup button.
+- LOG tab text is now selectable and Ctrl+C-copyable, not just
+  copyable via the whole-log button.
+- Enabled antialiasing (was off by default) — every canvas-drawn widget
+  (faders, DSP knobs, meters) is visibly less jagged.
 * Tue Jul 28 2026 FerroMix contributors <noreply@example.com> - 3.0.2-1
 - FIX: v3.0.1's XWayland fallback relaunched correctly but didn't
   actually change anything — it set WINIT_UNIX_BACKEND=x11, which the

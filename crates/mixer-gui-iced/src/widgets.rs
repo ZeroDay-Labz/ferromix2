@@ -6,7 +6,7 @@ use crate::theme;
 use crate::tokens;
 use crate::Message;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
-use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_input, Space};
+use iced::widget::{button, column, container, pick_list, row, scrollable, text, text_editor, text_input, Space};
 use iced::{Alignment, Background, Border, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme};
 use crate::RenameTarget;
 use mixer_core::engine::Command;
@@ -317,8 +317,8 @@ fn elide(s: &str, max: usize) -> String {
 
 fn knob<'a>(label: &'a str, value: f32, on: bool, accent: Color, strip: usize, dsp: StripDsp, is_gate: bool) -> Element<'a, Message> {
     let dial = Canvas::new(Dial { value, on, accent, strip, dsp, is_gate })
-        .width(Length::Fixed(48.0))
-        .height(Length::Fixed(48.0));
+        .width(Length::Fixed(44.0))
+        .height(Length::Fixed(44.0));
     let toggle = { let ndsp = if is_gate { StripDsp { gate_on: !dsp.gate_on, ..dsp } } else { StripDsp { comp_on: !dsp.comp_on, ..dsp } }; Message::Send(Command::SetStripDsp { strip, dsp: ndsp }) };
     // What this knob actually does to the audio, in the same units the
     // filter-chain module receives (see `dsp.rs`'s doc comment and
@@ -336,11 +336,25 @@ fn knob<'a>(label: &'a str, value: f32, on: bool, accent: Color, strip: usize, d
         .size(tokens::type_scale::MICRO)
         .color(if on { theme::TEXT_DIM } else { theme::EDGE })
         .center()
-        .width(Length::Fixed(48.0));
+        .width(Length::Fixed(44.0));
     let lbl = button(text(label).size(tokens::type_scale::CAPTION).color(if on { accent } else { theme::TEXT_DIM }).center().width(Length::Fill))
         .style(move |_t, s| button::Style { background: Some(accent_fill(if on { accent.scale_alpha(0.15) } else { theme::SEG_OFF }, s)), border: Border { color: if on { accent } else { theme::EDGE }, width: 1.0, radius: tokens::radius::SM.into() }, text_color: if on { accent } else { theme::TEXT_DIM }, ..Default::default() })
-        .width(Length::Fixed(48.0)).padding([2, 0]).on_press(toggle);
-    column![dial, readout_text, lbl].spacing(2).align_x(Alignment::Center).into()
+        .width(Length::Fixed(44.0)).padding([2, 0]).on_press(toggle);
+    // Housed as one instrument unit (dial + readout + toggle share a single
+    // bordered panel) instead of three stacked-but-unrelated-looking pieces
+    // — a faint accent wash and border when on, matching the same
+    // active/inactive language `theme::card_accent` uses for whole cards, so
+    // a live knob reads as "lit" the same way a live strip card does.
+    let body = column![dial, Space::with_height(2), readout_text, Space::with_height(3), lbl].spacing(0).align_x(Alignment::Center);
+    container(body)
+        .padding(5)
+        .width(Length::Fixed(54.0))
+        .style(move |_t| iced::widget::container::Style {
+            background: Some(Background::Color(if on { accent.scale_alpha(0.07) } else { theme::CARD_LO.scale_alpha(0.5) })),
+            border: Border { color: if on { accent.scale_alpha(0.45) } else { theme::EDGE_SOFT }, width: 1.0, radius: tokens::radius::MD.into() },
+            ..Default::default()
+        })
+        .into()
 }
 
 /// Interactive DSP knob. Click+drag vertically to set the amount, scroll to
@@ -684,14 +698,22 @@ fn strip_footer<'a>(idx: usize, strip: &'a Strip) -> Element<'a, Message> {
     let dsp = strip.dsp;
     let knobs = row![knob("GATE", dsp.gate, dsp.gate_on, theme::ACCENT, idx, dsp, true), Space::with_width(6), knob("COMP", dsp.comp, dsp.comp_on, theme::VIOLET, idx, dsp, false)];
     let mute = wide_button("MUTE", strip.mute, theme::REC_RED, Message::Send(Command::SetStripMute { strip: idx, mute: !strip.mute }));
+    // Standard mixer convention: red = mute, yellow/amber = solo — kept
+    // visually distinct from MUTE even though both live in the same row.
+    let solo = wide_button("SOLO", strip.solo, theme::MIC_AMBER, Message::Send(Command::SetStripSolo { strip: idx, solo: !strip.solo }));
     let rec = rec_button(strip.recording, RecTarget::Strip(idx));
     // Fixes a source that presents real stereo ports but only ever writes
     // audio into one of them (e.g. a SIP phone call heard in one ear only)
     // — see `Strip.force_mono`'s doc comment for why this can't be
     // auto-detected and needs an explicit switch.
     let mono_btn = wide_button("MONO", strip.force_mono, theme::MIC_AMBER, Message::Send(Command::SetStripForceMono { strip: idx, on: !strip.force_mono }));
-    column![section_label("DSP"), Space::with_height(3), knobs, Space::with_height(8), row![mute, Space::with_width(4), mono_btn, Space::with_width(4), rec].spacing(0)]
-        .spacing(0).into()
+    column![
+        section_label("DSP"), Space::with_height(3), knobs, Space::with_height(8),
+        row![mute, Space::with_width(4), solo].spacing(0),
+        Space::with_height(4),
+        row![mono_btn, Space::with_width(4), rec].spacing(0),
+    ]
+    .spacing(0).into()
 }
 
 pub fn strip_card<'a>(idx: usize, strip: &'a Strip, state: &'a MixerState, width: f32, renaming: Option<&'a str>, active: bool) -> Element<'a, Message> {
@@ -917,6 +939,19 @@ fn mini_rec_chip<'a>(label: &'a str, accent: Color, recording: bool, target: Rec
         .into()
 }
 
+/// A strip's SOLO toggle for the Matrix grid — same compact-chip shape as
+/// `mini_rec_chip`, amber instead of red (standard mixer convention: red =
+/// mute, yellow/amber = solo).
+fn mini_solo_chip<'a>(strip: usize, solo: bool) -> Element<'a, Message> {
+    let (bg, fg, edge) = if solo { (theme::MIC_AMBER, theme::BG_DEEP, theme::MIC_AMBER) } else { (theme::PANEL_HI, theme::TEXT_DIM, theme::EDGE) };
+    button(text("S").size(tokens::type_scale::CAPTION).color(fg).center().width(Length::Fill))
+        .style(move |_t, s| button::Style { background: Some(accent_fill(bg, s)), border: Border { color: edge, width: 1.0, radius: tokens::radius::SM.into() }, text_color: fg, ..Default::default() })
+        .width(Length::Fixed(22.0))
+        .padding([3, 0])
+        .on_press(Message::Send(Command::SetStripSolo { strip, solo: !solo }))
+        .into()
+}
+
 /// Consolidated recording dashboard: every bus (A then B, natural array
 /// order), each with its own compact REC toggle, so you can see/control
 /// exactly what's being recorded without hunting across scattered per-card
@@ -931,6 +966,45 @@ pub fn rec_panel<'a>(state: &'a MixerState) -> Element<'a, Message> {
     }
     container(row![text("REC").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM), Space::with_width(10), items].align_y(Alignment::Center))
         .padding([6, 10]).style(theme::card).into()
+}
+
+/// Shown only while at least one strip is soloed — professional mixers
+/// always surface this prominently, since it's easy to forget you left
+/// something soloed and be confused why every other channel went quiet.
+/// Empty (zero-height) otherwise, so it costs nothing when solo isn't in use.
+pub fn solo_banner<'a>(state: &'a MixerState) -> Element<'a, Message> {
+    let soloed: Vec<usize> = state.strips.iter().enumerate().filter(|(_, s)| s.solo).map(|(i, _)| i).collect();
+    if soloed.is_empty() {
+        return Space::with_height(0).into();
+    }
+    let names = soloed.iter().map(|&i| state.strips[i].display_name(i)).collect::<Vec<_>>().join(", ");
+    let clear_btn = button(text("CLEAR SOLO").size(tokens::type_scale::LABEL).color(theme::BG_DEEP).center())
+        .style(|_t, s| button::Style {
+            background: Some(accent_fill(theme::MIC_AMBER, s)),
+            border: Border { color: theme::MIC_AMBER, width: 1.0, radius: tokens::radius::SM.into() },
+            text_color: theme::BG_DEEP,
+            ..Default::default()
+        })
+        .padding([6, 14])
+        .on_press(Message::Send(Command::ClearAllSolo));
+    container(
+        row![
+            icons::icon(icons::Icon::Star, 14.0, theme::BG_DEEP),
+            Space::with_width(8),
+            text(format!("SOLO ACTIVE — {names}")).size(tokens::type_scale::BODY).color(theme::BG_DEEP),
+            Space::with_width(Length::Fill),
+            clear_btn,
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding([8, 14])
+    .width(Length::Fill)
+    .style(|_t| iced::widget::container::Style {
+        background: Some(Background::Color(theme::MIC_AMBER)),
+        border: Border { color: theme::MIC_AMBER, width: 1.0, radius: tokens::radius::MD.into() },
+        ..Default::default()
+    })
+    .into()
 }
 
 // ─────────────────────────────────────────────────────── MATRIX
@@ -960,8 +1034,20 @@ pub fn matrix_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
             .width(Length::Fixed(54.0)).center_x(Length::Fixed(54.0)),
         );
     }
+    header = header.push(container(text("SOLO").size(tokens::type_scale::CAPTION).color(theme::MIC_AMBER)).width(Length::Fixed(54.0)).center_x(Length::Fixed(54.0)));
     header = header.push(container(text("REC").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM)).width(Length::Fixed(54.0)).center_x(Length::Fixed(54.0)));
-    grid = grid.push(header);
+    // Housed as its own header bar (background + bottom rule) instead of
+    // floating loose above the grid — reads as a table header now, not just
+    // the first row that happens to have different content.
+    grid = grid.push(
+        container(header)
+            .padding([8, 4])
+            .style(|_t| iced::widget::container::Style {
+                background: Some(Background::Color(theme::CARD_LO.scale_alpha(0.6))),
+                border: Border { color: theme::EDGE_SOFT, width: 1.0, radius: tokens::radius::MD.into() },
+                ..Default::default()
+            }),
+    );
 
     for (si, strip) in state.strips.iter().enumerate() {
         let name = strip.display_name(si);
@@ -990,15 +1076,25 @@ pub fn matrix_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
                     border: Border { color: if on || fb { bg } else { theme::EDGE }, width: 1.0, radius: tokens::radius::MD.into() },
                     text_color: theme::BG_DEEP, ..Default::default()
                 })
-                .width(Length::Fixed(54.0)).height(Length::Fixed(30.0))
+                .width(Length::Fixed(54.0)).height(Length::Fixed(34.0))
                 .on_press(Message::Send(Command::ToggleAssign { strip: si, bus: bi }));
             r = r.push(cell);
         }
+        r = r.push(container(mini_solo_chip(si, strip.solo)).width(Length::Fixed(54.0)).center_x(Length::Fixed(54.0)));
         r = r.push(
             container(mini_rec_chip("", theme::TEXT_DIM, strip.recording, RecTarget::Strip(si)))
                 .width(Length::Fixed(54.0)).center_x(Length::Fixed(54.0)),
         );
-        grid = grid.push(r);
+        // Zebra striping: an every-other-row tint makes a wide grid (many
+        // strips × several buses) trackable at a glance without following
+        // gridlines with your eyes — the same legibility trick the LOG tab
+        // now uses for its entries.
+        let row_bg = if si % 2 == 1 { theme::CARD_LO.scale_alpha(0.35) } else { Color::TRANSPARENT };
+        grid = grid.push(container(r).padding([2, 4]).style(move |_t| iced::widget::container::Style {
+            background: Some(Background::Color(row_bg)),
+            border: Border { radius: tokens::radius::SM.into(), ..Default::default() },
+            ..Default::default()
+        }));
     }
 
     let head = column![
@@ -1013,14 +1109,91 @@ pub fn matrix_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
     // and legend stay left, reading naturally above it.
     let centered_grid = container(grid).width(Length::Fill).center_x(Length::Fill);
 
-    container(column![head, Space::with_height(16), centered_grid].spacing(0).padding(tokens::space::LG))
+    // The grid is a fixed-width table centered in whatever's left after the
+    // side panel — on a wide window that used to just be dead space either
+    // side of it. A real sidebar (not a bar squeezed above the grid) is what
+    // actually uses the left gutter specifically, not just "somewhere on the
+    // tab".
+    let body = row![matrix_side_panel(state), centered_grid].spacing(20).align_y(Alignment::Start);
+
+    container(column![head, Space::with_height(16), body].spacing(0).padding(tokens::space::LG))
         .width(Length::Fill).into()
+}
+
+/// Power-user panel filling the empty space to the left of the Matrix grid:
+/// an emergency PANIC/mute-all, quick feedback-guard access (mirrors the one
+/// in Settings, without switching tabs), and a solo summary/clear-all —
+/// broadcast/live-show controls that deserve one-click access, not three
+/// tabs deep.
+fn matrix_side_panel<'a>(state: &'a MixerState) -> Element<'a, Message> {
+    let panic_btn = button(text("⚠ PANIC — MUTE ALL").size(tokens::type_scale::LABEL).color(theme::BG_DEEP).center().width(Length::Fill))
+        .style(|_t, s| button::Style {
+            background: Some(accent_fill(theme::DANGER, s)),
+            border: Border { color: theme::DANGER, width: 1.0, radius: tokens::radius::SM.into() },
+            text_color: theme::BG_DEEP,
+            ..Default::default()
+        })
+        .padding([10, 0])
+        .on_press(Message::Send(Command::PanicMuteAll));
+
+    let guard = state.feedback_guard;
+    let guard_btn = wide_button(
+        if guard { "FEEDBACK GUARD: ON" } else { "FEEDBACK GUARD: OFF" },
+        guard,
+        theme::ACCENT,
+        Message::Send(Command::SetFeedbackGuard { on: !guard }),
+    );
+
+    let soloed_count = state.strips.iter().filter(|s| s.solo).count();
+    let solo_section: Element<Message> = if soloed_count > 0 {
+        column![
+            text(format!("{soloed_count} strip(s) soloed")).size(tokens::type_scale::CAPTION).color(theme::MIC_AMBER),
+            Space::with_height(6),
+            wide_button("CLEAR SOLO", true, theme::MIC_AMBER, Message::Send(Command::ClearAllSolo)),
+        ]
+        .into()
+    } else {
+        text("No strips soloed").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM).into()
+    };
+
+    container(
+        column![
+            section_label("QUICK ACTIONS"),
+            Space::with_height(8),
+            panic_btn,
+            Space::with_height(16),
+            section_label("FEEDBACK"),
+            Space::with_height(6),
+            guard_btn,
+            Space::with_height(16),
+            section_label("SOLO"),
+            Space::with_height(6),
+            solo_section,
+        ]
+        .spacing(0),
+    )
+    .padding(16)
+    .width(Length::Fixed(220.0))
+    .style(theme::card)
+    .into()
 }
 
 // ─────────────────────────────────────────────────────── SETTINGS
 
 pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -> Element<'a, Message> {
-    let section = |title: &'a str| text(title).size(tokens::type_scale::BODY).color(theme::ACCENT);
+    // Every section used to be an identically gray card — correct, but the
+    // eye has nothing to grab onto scanning down seven of them. Each now
+    // gets its own accent (reusing `theme::card_accent`, the exact same
+    // tinted-edge/glow language strip and bus cards already use, so this
+    // reads as an extension of the established visual system rather than a
+    // one-off), and an optional icon next to its title.
+    let section = move |title: &'a str, accent: Color, icon: Option<icons::Icon>| -> Element<'a, Message> {
+        let mut r = row![].align_y(Alignment::Center).spacing(6);
+        if let Some(ic) = icon {
+            r = r.push(icons::icon(ic, 14.0, accent));
+        }
+        r.push(text(title).size(tokens::type_scale::BODY).color(theme::TEXT)).into()
+    };
 
     // Feedback guard toggle.
     let guard = state.feedback_guard;
@@ -1034,13 +1207,14 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
     // Fixed (not Fill+max_width) so the column of cards has a well-defined
     // natural width the outer container can center as a group — see the
     // centering wrapper at the bottom of this function.
-    let card = |content: Element<'a, Message>| {
-        container(content).padding(16).width(Length::Fixed(640.0)).style(theme::card)
+    let card = |accent: Color, content: Element<'a, Message>| {
+        container(content).padding(16).width(Length::Fixed(640.0)).style(theme::card_accent(accent, false))
     };
 
     let routing = card(
+        theme::ACCENT,
         column![
-            section("ROUTING"),
+            section("ROUTING", theme::ACCENT, None),
             Space::with_height(8),
             container(guard_btn).width(Length::Fixed(260.0)),
             Space::with_height(6),
@@ -1076,8 +1250,9 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
         .on_press(Message::RecDirApply);
 
     let rec = card(
+        theme::REC_RED,
         column![
-            section("RECORDING"),
+            section("RECORDING", theme::REC_RED, None),
             Space::with_height(8),
             row![recdir_input, Space::with_width(6), apply_btn].align_y(Alignment::Center),
             Space::with_height(4),
@@ -1103,8 +1278,9 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
             .into()
     };
     let display = card(
+        theme::ACCENT_2,
         column![
-            section("DISPLAY"),
+            section("DISPLAY", theme::ACCENT_2, None),
             Space::with_height(8),
             row![
                 step_btn("−", -0.1),
@@ -1137,8 +1313,9 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
             .into()
     };
     let sample_rate = card(
+        theme::VIOLET,
         column![
-            section("SAMPLE RATE"),
+            section("SAMPLE RATE", theme::VIOLET, None),
             Space::with_height(8),
             row![rate_btn(44_100), Space::with_width(8), rate_btn(48_000), Space::with_width(8), rate_btn(96_000)],
             Space::with_height(6),
@@ -1148,16 +1325,41 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
         .into(),
     );
 
+    // Was a copy-paste-into-a-terminal instruction; now real buttons,
+    // exactly the same pattern as the SAMPLE RATE picker above (this applies
+    // live — no PipeWire restart needed, unlike sample rate).
+    let active_quantum = state.quantum;
+    let quantum_btn = move |label: &'static str, frames: u32| -> Element<'a, Message> {
+        let on = active_quantum == frames;
+        let (bg, fg, edge) = if on { (theme::VIOLET_2, theme::BG_DEEP, theme::VIOLET_2) } else { (theme::PANEL_HI, theme::TEXT_DIM, theme::EDGE) };
+        button(text(label).size(tokens::type_scale::LABEL).color(fg).center().width(Length::Fill))
+            .style(move |_t, s| button::Style {
+                background: Some(accent_fill(bg, s)),
+                border: Border { color: edge, width: 1.0, radius: tokens::radius::SM.into() },
+                text_color: fg,
+                ..Default::default()
+            })
+            .padding([6, 0])
+            .on_press(Message::Send(Command::SetQuantum { frames }))
+            .into()
+    };
     let latency = card(
+        theme::VIOLET_2,
         column![
-            section("LATENCY (the Linux \"ASIO\")"),
+            section("LATENCY (the Linux \"ASIO\")", theme::VIOLET_2, Some(icons::Icon::Headphones)),
             Space::with_height(8),
-            text("FerroMix2 runs on PipeWire — no ASIO driver needed. For low-latency, set a small quantum globally:").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM),
+            text("Forces PipeWire's graph quantum (buffer size) globally — every app, not just FerroMix.").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM),
             Space::with_height(6),
-            container(text("pw-metadata -n settings 0 clock.force-quantum 256").size(tokens::type_scale::LABEL).color(theme::ACCENT))
-                .padding(tokens::space::SM).style(|_t| iced::widget::container::Style { background: Some(iced::Background::Color(theme::BG_DEEP)), border: Border { color: theme::EDGE, width: 1.0, radius: tokens::radius::SM.into() }, ..Default::default() }),
-            Space::with_height(4),
-            text("256 samples @ 48kHz ≈ 5ms. Lower = tighter but more CPU. Reset with clock.force-quantum 0.").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM),
+            row![
+                quantum_btn("AUTO", 0), Space::with_width(6),
+                quantum_btn("32", 32), Space::with_width(6),
+                quantum_btn("64", 64), Space::with_width(6),
+                quantum_btn("128", 128), Space::with_width(6),
+                quantum_btn("256", 256), Space::with_width(6),
+                quantum_btn("512", 512),
+            ],
+            Space::with_height(6),
+            text("256 samples @ 48kHz ≈ 5ms. Lower = tighter but more CPU; if audio starts crackling, go back up.").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM),
         ]
         .spacing(0)
         .into(),
@@ -1167,21 +1369,39 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
         .style(|_t, s| button::Style { background: Some(accent_fill(theme::MIC_AMBER, s)), border: Border { color: theme::MIC_AMBER, width: 1.0, radius: tokens::radius::SM.into() }, text_color: theme::BG_DEEP, ..Default::default() })
         .padding([8, 0])
         .on_press(Message::ResetAudio);
+    let panic_btn = button(text("⚠ PANIC — MUTE EVERY STRIP AND BUS").size(tokens::type_scale::LABEL).color(theme::BG_DEEP).center().width(Length::Fill))
+        .style(|_t, s| button::Style { background: Some(accent_fill(theme::DANGER, s)), border: Border { color: theme::DANGER, width: 1.0, radius: tokens::radius::SM.into() }, text_color: theme::BG_DEEP, ..Default::default() })
+        .padding([8, 0])
+        .on_press(Message::Send(Command::PanicMuteAll));
+    let export_btn = button(text("⬇ EXPORT CONFIG BACKUP").size(tokens::type_scale::LABEL).color(theme::TEXT).center().width(Length::Fill))
+        .style(|_t, s| button::Style { background: Some(accent_fill(theme::PANEL_HI, s)), border: Border { color: theme::EDGE, width: 1.0, radius: tokens::radius::SM.into() }, text_color: theme::TEXT, ..Default::default() })
+        .padding([8, 0])
+        .on_press(Message::Send(Command::ExportConfig));
     let recovery = card(
+        theme::MIC_AMBER,
         column![
-            section("RECOVERY"),
+            section("RECOVERY", theme::MIC_AMBER, None),
             Space::with_height(8),
+            container(panic_btn).width(Length::Fixed(320.0)),
+            Space::with_height(4),
+            text("Instantly mutes every strip and bus — for the \"cut it NOW\" moment mid-show. Routing itself is untouched, so un-muting brings everything straight back.").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM),
+            Space::with_height(10),
             container(reset_btn).width(Length::Fixed(320.0)),
             Space::with_height(6),
             text("Restarts PipeWire, PipeWire-Pulse and WirePlumber back to a clean, stock state — the fix if audio ever gets stuck (most often after a DSP module misbehaves). Restart FerroMix itself afterward — its connection to the old PipeWire session won't survive the restart.").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM),
+            Space::with_height(10),
+            container(export_btn).width(Length::Fixed(320.0)),
+            Space::with_height(4),
+            text("Saves a timestamped copy of config.toml alongside the real one — a safety net for a show-day setup. To restore one, copy it back over config.toml and restart FerroMix.").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM),
         ]
         .spacing(0)
         .into(),
     );
 
     let about = card(
+        theme::EDGE,
         column![
-            section("ABOUT"),
+            section("ABOUT", theme::TEXT_DIM, Some(icons::Icon::Star)),
             Space::with_height(8),
             text("FerroMix2 — an open-source Virtual mixer for Linux / PipeWire.").size(tokens::type_scale::LABEL).color(theme::TEXT),
             text("Every strip receives one source. A-buses you hear; B-buses are virtual mics apps read. MUTE cuts a strip everywhere.").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM),
@@ -1211,21 +1431,30 @@ pub fn settings_view<'a>(state: &'a MixerState, recdir_draft: Option<&'a str>) -
 
 // ─────────────────────────────────────────────────────── LOG
 
+/// Classify a log line by its own content — the messages `engine.rs`/
 /// Activity log — newest entries first, so the most recent routing/feedback/
-/// save events are visible without scrolling.
-pub fn log_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
-    let mut lines = column![].spacing(4);
-    for line in state.log.iter().rev() {
-        lines = lines.push(text(line).size(tokens::type_scale::LABEL).color(theme::TEXT_DIM).font(iced::Font::MONOSPACE));
-    }
+/// save events are visible without scrolling. Rendered in a real
+/// `text_editor` (see `Message::LogEditorAction`'s doc comment for how it
+/// stays read-only) specifically so it supports native mouse-drag selection
+/// and Ctrl+C copy, not just the whole-log "⧉ COPY LOG" button.
+///
+/// Trade-off, noted rather than silently dropped: the per-line color-coded
+/// severity markers an earlier pass added here don't have an obvious home
+/// inside a single editor buffer without a custom `text_editor::Highlighter`
+/// — a real chunk of extra work. This ships plain selectable text first; a
+/// colored `Highlighter` is a reasonable fast-follow if losing the at-a-
+/// glance coloring actually bothers you in practice.
+pub fn log_view<'a>(editor: &'a text_editor::Content) -> Element<'a, Message> {
     let copy_btn = button(text("⧉ COPY LOG").size(tokens::type_scale::LABEL).color(theme::TEXT_DIM))
         .style(|_t, s| button::Style { background: Some(accent_fill(theme::PANEL_HI, s)), border: Border { color: theme::EDGE, width: 1.0, radius: tokens::radius::MD.into() }, text_color: theme::TEXT_DIM, ..Default::default() })
         .padding([6, 12])
         .on_press(Message::CopyLog);
     let head = row![
+        icons::icon(icons::Icon::List, 18.0, theme::TEXT),
+        Space::with_width(8),
         column![
             text("ACTIVITY LOG").size(tokens::type_scale::TITLE).color(theme::TEXT),
-            text("Routing changes, feedback blocks, saves — newest first.").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM),
+            text("Routing changes, feedback blocks, saves — newest first. Click and drag to select, Ctrl+C to copy.").size(tokens::type_scale::CAPTION).color(theme::TEXT_DIM),
         ]
         .spacing(4),
         Space::with_width(Length::Fill),
@@ -1233,11 +1462,31 @@ pub fn log_view<'a>(state: &'a MixerState) -> Element<'a, Message> {
     ]
     .align_y(Alignment::Center);
 
-    scrollable(
-        column![head, Space::with_height(16), container(lines).padding(tokens::space::MD).width(Length::Fill).style(theme::card)]
-            .spacing(0)
-            .padding(tokens::space::LG),
-    )
+    // The editor has its own internal scroll viewport — no outer
+    // `scrollable` here, that would just fight it for the scroll gesture.
+    let body = text_editor(editor)
+        .on_action(Message::LogEditorAction)
+        .size(tokens::type_scale::LABEL)
+        .padding(tokens::space::MD)
+        .height(Length::Fill)
+        .style(|_t, _s| text_editor::Style {
+            background: Background::Color(theme::BG_DEEP),
+            border: Border { color: theme::EDGE_SOFT, width: 1.0, radius: tokens::radius::MD.into() },
+            icon: theme::TEXT_DIM,
+            placeholder: theme::TEXT_DIM,
+            value: theme::TEXT,
+            selection: theme::ACCENT.scale_alpha(0.35),
+        });
+
+    column![
+        container(head).padding(iced::Padding { top: 16.0, right: 16.0, bottom: 0.0, left: 16.0 }),
+        Space::with_height(16),
+        container(body)
+            .padding(iced::Padding { top: 0.0, right: 16.0, bottom: 16.0, left: 16.0 })
+            .width(Length::Fill)
+            .height(Length::Fill),
+    ]
+    .spacing(0)
     .width(Length::Fill)
     .height(Length::Fill)
     .into()

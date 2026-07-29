@@ -1,6 +1,9 @@
 # Maintainer: you <you@example.com>
 pkgname=ferromix2-git
-pkgver=3.0.2
+# pacman's pkgver can't contain a hyphen either — same reasoning as the RPM
+# spec's Version/Release split (see its header comment), Arch convention
+# for this is dots instead: 3.1.0-alpha.1 -> 3.1.0.alpha1.
+pkgver=3.1.0.alpha1
 pkgrel=1
 pkgdesc="Voicemeeter-style virtual audio mixer for PipeWire"
 arch=('x86_64')

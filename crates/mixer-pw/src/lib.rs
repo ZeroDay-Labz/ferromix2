@@ -29,6 +29,7 @@ pub(crate) enum PwCmd {
     SetStripInput { idx: usize, source_key: Option<String> },
     SetStripVolume { idx: usize, volume: f32 },
     SetStripMute { idx: usize, mute: bool },
+    SetStripSolo { idx: usize, solo: bool },
     SetStripAssign { idx: usize, bus: usize, on: bool },
     SetStripDsp { idx: usize, dsp: StripDsp },
     SetStripForceMono { idx: usize, on: bool },
@@ -89,6 +90,9 @@ impl AudioBackend for PwBackend {
     }
     fn set_strip_mute(&mut self, idx: usize, mute: bool) -> BackendResult {
         self.send(PwCmd::SetStripMute { idx, mute })
+    }
+    fn set_strip_solo(&mut self, idx: usize, solo: bool) -> BackendResult {
+        self.send(PwCmd::SetStripSolo { idx, solo })
     }
     fn set_strip_assign(&mut self, idx: usize, bus_idx: usize, on: bool) -> BackendResult {
         self.send(PwCmd::SetStripAssign { idx, bus: bus_idx, on })

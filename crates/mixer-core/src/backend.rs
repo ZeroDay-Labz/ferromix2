@@ -50,6 +50,11 @@ pub trait AudioBackend: Send {
 
     fn set_strip_volume(&mut self, idx: usize, volume: f32) -> BackendResult;
     fn set_strip_mute(&mut self, idx: usize, mute: bool) -> BackendResult;
+    /// PFL solo — see `Strip.solo`'s doc comment for the full semantics
+    /// (mute always wins; no strip soloed = unaffected). Doesn't change
+    /// `idx`'s own mute state, only whether *other* non-soloed strips'
+    /// sends get cut once at least one strip somewhere is soloed.
+    fn set_strip_solo(&mut self, idx: usize, solo: bool) -> BackendResult;
     /// Does strip `idx` feed bus `bus_idx`?
     fn set_strip_assign(&mut self, idx: usize, bus_idx: usize, on: bool) -> BackendResult;
 

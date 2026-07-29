@@ -85,6 +85,14 @@ struct Desired {
     strip_input: HashMap<usize, String>,
     strip_vol: HashMap<usize, f32>,
     strip_mute: HashMap<usize, bool>,
+    /// PFL solo — see `Strip.solo`'s doc comment. Deliberately scoped to
+    /// HARDWARE-out (A-bus) sends only in the reconciler (step 3, below) —
+    /// never B-buses. A B-bus feeds another *application's* mic (Discord,
+    /// a streaming/recording pipeline); soloing a strip is for your own
+    /// monitoring, and must never silently cut what a remote listener
+    /// actually hears out from under you. Only the operator's own hardware
+    /// monitor path is fair game for solo.
+    strip_solo: HashMap<usize, bool>,
     /// strip -> force_mono (see `Strip.force_mono`'s doc comment).
     strip_force_mono: HashMap<usize, bool>,
     /// (strip, bus) sends.
@@ -795,6 +803,18 @@ fn resolve_capture(graph: &Graph, key: &str) -> Vec<NodeId> {
 /// B2 link "stray" while processing B1's, then cut B1's link "stray" while
 /// processing B2's, back and forth every pass.
 ///
+/// Whether a strip's send to a bus of `kind` should be cut, given its own
+/// mute state and the mix's overall solo state. Pure so the mute/solo
+/// interaction (mute always wins; solo only ever cuts a HARDWARE-out send,
+/// never a B-bus — see `Desired.strip_solo`'s doc comment for why a B-bus,
+/// which feeds another application's mic, must never be silenced just
+/// because you soloed a strip for your own monitoring) is unit-testable
+/// without a live PipeWire graph, the same way `stray_destinations`/
+/// `stray_sources` below are.
+fn send_should_cut(muted: bool, kind: BusKind, any_soloed: bool, this_soloed: bool) -> bool {
+    muted || (kind == BusKind::HwOutput && any_soloed && !this_soloed)
+}
+
 /// Pure over `Graph`, deduplicated (a stereo app has two links — FL/FR — to
 /// the same stray destination, which should be one redirect, not two).
 fn stray_destinations(graph: &Graph, out_node: NodeId, keep: &[NodeId]) -> Vec<NodeId> {
@@ -1450,18 +1470,31 @@ fn reconcile(ctx: &Ctx) {
         // muted: the user has explicitly asked for silence, so losing that
         // 250ms window every single recreation is a real, repeating audio
         // leak, not a cosmetic flicker. Muted strips skip the grace period
-        // entirely and get cut on sight.
-        let muted_strip_nodes: HashSet<NodeId> = st
-            .desired
-            .strip_mute
+        // entirely and get cut on sight — same for a strip that's soloed OUT
+        // (something else is soloed, this one isn't): this particular fight
+        // is specifically about an app being stolen back to the real
+        // hardware sink, i.e. exactly the monitor path solo already governs
+        // in step 3, so the same "no audible cost to being aggressive" logic
+        // applies without needing an A/B-bus distinction here.
+        let any_soloed_stray = st.desired.strip_solo.values().any(|&s| s);
+        // Iterate every strip that has a real node, not just ones with a
+        // `strip_mute` entry — a strip that's soloed OUT but was never
+        // explicitly muted (no entry in that map at all) still needs to
+        // land in this set, or it'd wrongly keep the 250ms grace period.
+        let silenced_strip_nodes: HashSet<NodeId> = st
+            .strip_nodes
             .iter()
-            .filter(|(_, &muted)| muted)
-            .filter_map(|(idx, _)| st.strip_nodes.get(idx).map(|(id, _)| *id))
+            .filter(|(idx, _)| {
+                let muted = st.desired.strip_mute.get(idx).copied().unwrap_or(false);
+                let soloed_out = any_soloed_stray && !st.desired.strip_solo.get(idx).copied().unwrap_or(false);
+                muted || soloed_out
+            })
+            .map(|(_, (id, _))| *id)
             .collect();
         for key @ (node, other) in current_stray {
             let strip_muted = legit_by_src
                 .get(&node)
-                .is_some_and(|strips| strips.iter().any(|s| muted_strip_nodes.contains(s)));
+                .is_some_and(|strips| strips.iter().any(|s| silenced_strip_nodes.contains(s)));
             let first = *st.stray_dest_first_seen.entry(key).or_insert_with(Instant::now);
             if strip_muted || first.elapsed() >= Duration::from_millis(250) {
                 log::info!(
@@ -1475,23 +1508,31 @@ fn reconcile(ctx: &Ctx) {
             }
         }
 
-        // 3. strip -> bus sends (with the feedback guard AND mute)
+        // 3. strip -> bus sends (with the feedback guard, mute, AND solo)
         let assigns: Vec<(usize, usize)> = st.desired.assigns.iter().copied().collect();
+        // Solo is scoped to hardware-out sends only — see `Desired.strip_solo`'s
+        // doc comment for why a B-bus (feeding another app's mic) must never
+        // be cut by soloing a strip for your own monitoring.
+        let any_soloed = st.desired.strip_solo.values().any(|&s| s);
         for (sidx, bidx) in assigns {
             let (Some(&(strip_node, _)), Some(&(bus_node, _))) =
                 (st.strip_nodes.get(&sidx), st.bus_nodes.get(&bidx))
             else {
                 continue;
             };
-            // MUTE means the strip sends NOWHERE. We cut the actual links rather
-            // than only muting the node, because a null-sink's monitor keeps
-            // emitting into a B bus even when the sink itself is muted — that was
-            // the "muted mic still reaches Discord" bug. A muted strip = no links.
-            if st.desired.strip_mute.get(&sidx).copied().unwrap_or(false) {
+            let kind = st.desired.buses.get(&bidx).map(|(_, k)| *k).unwrap_or(BusKind::HwOutput);
+            // MUTE means the strip sends NOWHERE, and SOLO (hardware-out
+            // sends only — see `send_should_cut`'s doc comment) can too. We
+            // cut the actual links rather than only muting the node, because
+            // a null-sink's monitor keeps emitting into a B bus even when the
+            // sink itself is muted — that was the "muted mic still reaches
+            // Discord" bug. A muted (or soloed-out) strip = no links.
+            let this_soloed = st.desired.strip_solo.get(&sidx).copied().unwrap_or(false);
+            let muted = st.desired.strip_mute.get(&sidx).copied().unwrap_or(false);
+            if send_should_cut(muted, kind, any_soloed, this_soloed) {
                 remove_links_between(ctx, st, strip_node, bus_node);
                 continue;
             }
-            let kind = st.desired.buses.get(&bidx).map(|(_, k)| *k).unwrap_or(BusKind::HwOutput);
             if st.feedback_guard
                 && kind == BusKind::VirtualMic
                 && strip_listens_to_bus(st, sidx, bus_node)
@@ -1870,6 +1911,7 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             st.desired.strip_input.remove(&idx);
             st.desired.strip_vol.remove(&idx);
             st.desired.strip_mute.remove(&idx);
+            st.desired.strip_solo.remove(&idx);
             st.desired.strip_force_mono.remove(&idx);
             st.desired.assigns.retain(|(s, _)| *s != idx);
             st.bus_strip_feeds.retain(|(_, s)| *s != idx);
@@ -1942,6 +1984,13 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             // Mute also cuts/restores the strip's sends, so reconcile the graph
             // rather than only toggling the node flag.
             apply_strip_controls(ctx);
+            reconcile_all(ctx);
+        }
+        PwCmd::SetStripSolo { idx, solo } => {
+            ctx.st.borrow_mut().desired.strip_solo.insert(idx, solo);
+            // Toggling one strip's solo changes whether every OTHER strip's
+            // hardware-out sends survive (see `Desired.strip_solo`'s doc
+            // comment) — a full reconcile, not just this one strip's links.
             reconcile_all(ctx);
         }
         PwCmd::SetStripAssign { idx, bus, on } => {
@@ -2457,6 +2506,38 @@ mod feedback_tests {
         let mut g = Graph::default();
         g.nodes.insert(20, app(20, "discord", "Stream/Output/Audio"));
         assert!(resolve_capture(&g, "discord").is_empty());
+    }
+
+    #[test]
+    fn send_should_cut_mute_always_cuts_regardless_of_bus_kind() {
+        assert!(send_should_cut(true, BusKind::HwOutput, false, false));
+        assert!(send_should_cut(true, BusKind::VirtualMic, false, false));
+    }
+
+    #[test]
+    fn send_should_cut_no_solo_active_never_cuts_on_solo_grounds() {
+        assert!(!send_should_cut(false, BusKind::HwOutput, false, false));
+        assert!(!send_should_cut(false, BusKind::VirtualMic, false, false));
+    }
+
+    #[test]
+    fn send_should_cut_solo_cuts_non_soloed_hardware_send() {
+        // Something else is soloed, this strip isn't, bus is hardware: cut.
+        assert!(send_should_cut(false, BusKind::HwOutput, true, false));
+    }
+
+    #[test]
+    fn send_should_cut_solo_spares_the_soloed_strip_itself() {
+        assert!(!send_should_cut(false, BusKind::HwOutput, true, true));
+    }
+
+    #[test]
+    fn send_should_cut_solo_never_touches_virtual_mic_sends() {
+        // The whole point of solo: it must never silence what another
+        // application (Discord, a stream) is actually receiving, only your
+        // own hardware monitor path — regardless of who's soloed.
+        assert!(!send_should_cut(false, BusKind::VirtualMic, true, false));
+        assert!(!send_should_cut(false, BusKind::VirtualMic, true, true));
     }
 
     /// Regression for the "Spotify plays but the strip's fader does nothing"

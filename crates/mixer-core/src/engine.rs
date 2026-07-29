@@ -16,6 +16,14 @@ pub enum Command {
     ToggleAssign { strip: usize, bus: usize },
     SetStripVolume { strip: usize, volume: f32 },
     SetStripMute { strip: usize, mute: bool },
+    /// PFL solo — see `Strip.solo`'s doc comment. Mute always wins over
+    /// solo; this doesn't touch `mute` at all, just whether a non-muted
+    /// strip's sends survive when something else in the mix is soloed.
+    SetStripSolo { strip: usize, solo: bool },
+    /// Clears every strip's solo in one shot, via the same per-strip solo
+    /// path each already has — same reasoning as `PanicMuteAll`: one atomic
+    /// engine command with one log line, not N separate GUI-fired commands.
+    ClearAllSolo,
     SetStripDsp { strip: usize, dsp: crate::model::StripDsp },
     /// See `Strip.force_mono`'s doc comment.
     SetStripForceMono { strip: usize, on: bool },
@@ -40,6 +48,16 @@ pub enum Command {
     /// button) is — streams may briefly glitch/reconnect while the graph
     /// renegotiates — that's expected, not a bug to engineer around.
     SetSampleRate { rate: u32 },
+    /// Forces PipeWire's graph quantum (buffer size, in samples — the Linux
+    /// equivalent of an ASIO buffer size) via
+    /// `pw-metadata -n settings 0 clock.force-quantum`. `0` = auto/unforced.
+    /// Unlike `SetSampleRate`, this applies live — no PipeWire restart.
+    SetQuantum { frames: u32 },
+    /// Writes a timestamped copy of `config.toml` next to the real one — a
+    /// safety net so a show-day setup can be recovered if the live config
+    /// gets clobbered. Restoring is manual (copy the backup back over
+    /// `config.toml` and restart) rather than a GUI import flow.
+    ExportConfig,
     SetStripName { strip: usize, name: String },
     SetBusName { bus: usize, name: String },
     ToggleBusMonitor { bus: usize, a_bus: usize },
@@ -78,6 +96,12 @@ pub enum Command {
     /// this is a pause, not a reset. Persisted (`Config.enabled`) so a
     /// daemon restart doesn't silently re-enable it.
     SetEnabled { on: bool },
+    /// Emergency silence: mutes every strip and every bus in one shot, via
+    /// the same per-strip/per-bus mute path each already has — not a
+    /// separate backend concept, just "call the existing mute command on
+    /// everything, atomically, with one log line" for one-click access
+    /// during a live show. Does not touch `solo` state.
+    PanicMuteAll,
     Save,
 }
 
@@ -190,6 +214,7 @@ fn initial_state(cfg: &Config) -> MixerState {
                 kind: None,
                 volume: s.volume,
                 mute: s.mute,
+                solo: false,
                 level: Level::default(),
                 assign,
                 recording: false,
@@ -214,6 +239,7 @@ fn initial_state(cfg: &Config) -> MixerState {
         feedback_guard: cfg.feedback_guard,
         ui_scale: cfg.ui_scale,
         sample_rate: cfg.sample_rate,
+        quantum: cfg.quantum,
         enabled: cfg.enabled,
         backend_alive: true,
         log: Vec::new(),
@@ -254,6 +280,18 @@ fn apply_sample_rate_metadata(rate: u32) {
         .output();
     let _ = std::process::Command::new("pw-metadata")
         .args(["-n", "settings", "0", "clock.force-rate", &rate.to_string()])
+        .output();
+}
+
+/// Write `clock.force-quantum` — see `Config.quantum`'s doc comment.
+/// `0` clears the override (PipeWire's own auto-negotiated quantum).
+/// Unlike sample rate, this applies live — confirmed by the LATENCY card's
+/// own long-documented `pw-metadata` instructions never having required a
+/// PipeWire restart, so `Command::SetQuantum`'s handler doesn't restart
+/// anything, just writes this and moves on.
+fn apply_quantum_metadata(frames: u32) {
+    let _ = std::process::Command::new("pw-metadata")
+        .args(["-n", "settings", "0", "clock.force-quantum", &frames.to_string()])
         .output();
 }
 
@@ -358,6 +396,11 @@ fn run(
         // when `sample_rate` is already 48000 (the default).
         if config.sample_rate != 48_000 {
             apply_sample_rate_metadata(config.sample_rate);
+        }
+        // Same re-assertion reasoning as sample rate just above — PipeWire
+        // doesn't remember `clock.force-quantum` across a restart either.
+        if config.quantum != 0 {
+            apply_quantum_metadata(config.quantum);
         }
         // Each strip is a virtual sink device apps can point their output at.
         for (i, _s) in st.strips.iter().enumerate() {
@@ -573,6 +616,23 @@ fn run(
                         s.mute = mute;
                     }
                     let _ = backend.set_strip_mute(strip, mute);
+                }
+                Command::SetStripSolo { strip, solo } => {
+                    if let Some(s) = st.strips.get_mut(strip) {
+                        s.solo = solo;
+                    }
+                    let label = st.strips.get(strip).map(|s| s.display_name(strip)).unwrap_or_default();
+                    st.push_log(format!("{} {} solo {}", ts(), label, if solo { "ON" } else { "OFF" }));
+                    let _ = backend.set_strip_solo(strip, solo);
+                }
+                Command::ClearAllSolo => {
+                    for i in 0..st.strips.len() {
+                        if st.strips[i].solo {
+                            st.strips[i].solo = false;
+                            let _ = backend.set_strip_solo(i, false);
+                        }
+                    }
+                    st.push_log(format!("{} solo cleared", ts()));
                 }
                 Command::SetBusVolume { bus, volume } => {
                     let v = volume.clamp(0.0, 1.0);
@@ -790,6 +850,37 @@ fn run(
                         apply_sample_rate_metadata(rate);
                     });
                 }
+                Command::SetQuantum { frames } => {
+                    // Only the picker's own options — same reasoning as
+                    // SetSampleRate's validation, a stray value falls back
+                    // to 0 (auto) rather than forcing something PipeWire
+                    // might refuse outright.
+                    let frames = match frames { 32 | 64 | 128 | 256 | 512 => frames, _ => 0 };
+                    config.quantum = frames;
+                    st.quantum = frames;
+                    let _ = config.save();
+                    apply_quantum_metadata(frames);
+                    st.push_log(format!(
+                        "{} quantum → {}",
+                        ts(),
+                        if frames == 0 { "auto".to_string() } else { format!("{frames} samples") }
+                    ));
+                }
+                Command::ExportConfig => {
+                    // Serializes the live in-memory config, not a copy of
+                    // whatever's currently on disk — the GUI autosaves ~1.5s
+                    // after the last change, so a copy-the-file approach
+                    // could miss a change made just before clicking export.
+                    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                    let backup = Config::path().with_file_name(format!("config-backup-{secs}.toml"));
+                    let result = toml::to_string_pretty(&config)
+                        .map_err(|e| e.to_string())
+                        .and_then(|s| std::fs::write(&backup, s).map_err(|e| e.to_string()));
+                    match result {
+                        Ok(()) => st.push_log(format!("{} config exported → {}", ts(), backup.display())),
+                        Err(e) => st.push_log(format!("{} config export FAILED: {e}", ts())),
+                    }
+                }
                 Command::SetFeedbackGuard { on } => {
                     config.feedback_guard = on;
                     st.feedback_guard = on;
@@ -807,6 +898,17 @@ fn run(
                         if on { "routing config applied" } else { "released to stock PipeWire" }
                     ));
                     let _ = backend.set_enabled(on);
+                }
+                Command::PanicMuteAll => {
+                    for i in 0..st.strips.len() {
+                        st.strips[i].mute = true;
+                        let _ = backend.set_strip_mute(i, true);
+                    }
+                    for i in 0..st.buses.len() {
+                        st.buses[i].mute = true;
+                        let _ = backend.set_bus_mute(i, true);
+                    }
+                    st.push_log(format!("{} ⚠ PANIC — every strip and bus muted", ts()));
                 }
                 Command::AddStrip => {
                     let n = st.buses.len();

@@ -11,7 +11,7 @@ mod theme;
 mod tokens;
 mod widgets;
 
-use iced::widget::{button, column, container, row, scrollable, text, Space};
+use iced::widget::{button, column, container, row, scrollable, text, text_editor, Space};
 use iced::{Element, Length, Subscription, Task};
 use mixer_core::engine::{Command, EngineHandle};
 use mixer_core::model::{BusKind, MixerState};
@@ -85,6 +85,12 @@ fn main() -> iced::Result {
     iced::application("FerroMix2", App::update, App::view)
         .subscription(App::subscription)
         .theme(|_| theme::base())
+        // Off by default in iced (`Settings::antialiasing` defaults to
+        // `false`) — this console is almost entirely hand-drawn canvas
+        // widgets (faders, DSP knobs, meters), which is exactly what benefits
+        // most from this; without it every arc/circle they draw is visibly
+        // jagged.
+        .antialiasing(true)
         .scale_factor(|app: &App| {
             app.state
                 .as_ref()
@@ -151,6 +157,15 @@ struct App {
     /// the amber "active stack" outline. Cleared by `Tick` once it's decayed
     /// past `ACTIVE_HIGHLIGHT`.
     active: Option<(RenameTarget, Instant)>,
+    /// The LOG tab's text, held as a `text_editor::Content` (not a plain
+    /// `text!` list) specifically so it supports native mouse-drag selection
+    /// and Ctrl+C copy — see `Message::LogEditorAction`'s doc comment for how
+    /// it stays read-only anyway. Rebuilt wholesale only when the log
+    /// actually changes (`log_editor_text` tracks what's currently loaded),
+    /// not every 16ms tick — replacing it resets any in-progress selection,
+    /// which is an acceptable trade for not diffing text content every frame.
+    log_editor: text_editor::Content,
+    log_editor_text: String,
 }
 
 /// Which strip/bus a `Command` targets, for the active-stack highlight — a
@@ -164,6 +179,7 @@ fn command_target(c: &Command) -> Option<RenameTarget> {
         SetStripInput { strip, .. }
         | SetStripVolume { strip, .. }
         | SetStripMute { strip, .. }
+        | SetStripSolo { strip, .. }
         | SetStripDsp { strip, .. }
         | SetStripForceMono { strip, .. }
         | SetStripListener { strip, .. } => Some(RenameTarget::Strip(strip)),
@@ -180,8 +196,9 @@ fn command_target(c: &Command) -> Option<RenameTarget> {
             mixer_core::model::RecTarget::Strip(s) => Some(RenameTarget::Strip(s)),
             mixer_core::model::RecTarget::Bus(b) => Some(RenameTarget::Bus(b)),
         },
-        SetRecordingsDir { .. } | SetUiScale { .. } | SetSampleRate { .. } | SetStripName { .. } | SetBusName { .. }
-        | SetFeedbackGuard { .. } | SetEnabled { .. } | AddStrip | RemoveLastStrip | Save => None,
+        SetRecordingsDir { .. } | SetUiScale { .. } | SetSampleRate { .. } | SetQuantum { .. } | ExportConfig
+        | SetStripName { .. } | SetBusName { .. } | SetFeedbackGuard { .. } | SetEnabled { .. } | AddStrip
+        | RemoveLastStrip | PanicMuteAll | ClearAllSolo | Save => None,
     }
 }
 
@@ -233,6 +250,14 @@ enum Message {
     RecDirChanged(String),
     RecDirApply,
     CopyLog,
+    /// An interaction with the LOG tab's `text_editor` — click, drag, scroll,
+    /// select. Forwarded to `App::log_editor` only when `!action.is_edit()`
+    /// (`text_editor::Action::is_edit`), which is how it stays read-only
+    /// (nothing in this app's UI ever calls `on_input`/inserts characters
+    /// into it) while still getting native mouse-drag selection and Ctrl+C
+    /// copy — copying a selection doesn't route through `Action` at all in
+    /// iced's editor, so filtering out edits doesn't block it.
+    LogEditorAction(text_editor::Action),
     /// Restart PipeWire/WirePlumber/pipewire-pulse back to a clean, stock
     /// state — the escape hatch for when something (e.g. a DSP module) has
     /// left the live graph in a bad state that FerroMix itself can't recover
@@ -263,6 +288,8 @@ impl App {
                 renaming: None,
                 recdir_draft: None,
                 active: None,
+                log_editor: text_editor::Content::new(),
+                log_editor_text: String::new(),
             },
             Task::none(),
         )
@@ -346,6 +373,11 @@ impl App {
                     return iced::clipboard::write(text);
                 }
             }
+            Message::LogEditorAction(action) => {
+                if !action.is_edit() {
+                    self.log_editor.perform(action);
+                }
+            }
             Message::ResetAudio => {
                 self.status = "resetting PipeWire/WirePlumber…".into();
                 // Fire-and-forget: restarting these services drops our own
@@ -398,6 +430,18 @@ impl App {
                     }
                 } else {
                     self.disconnected_since = None;
+                }
+
+                // Rebuild the LOG tab's editor content only when the log
+                // actually changed, not every 16ms tick — replacing it more
+                // often than that would reset an in-progress mouse
+                // selection out from under you constantly.
+                if let Some(state) = &self.state {
+                    let joined = state.log.join("\n");
+                    if joined != self.log_editor_text {
+                        self.log_editor = text_editor::Content::with_text(&joined);
+                        self.log_editor_text = joined;
+                    }
                 }
 
                 if self.dirty {
@@ -587,6 +631,8 @@ impl App {
                 .into();
         };
 
+        let solo_banner = widgets::solo_banner(state);
+
         // Hardware-out row: A1/A2/A3 device slots across the top. Label sits
         // above (matching the INPUT STRIPS/VIRTUAL MICS label pattern below).
         // Left-aligned, matching every other section's label/content
@@ -689,6 +735,8 @@ impl App {
         .align_y(iced::Alignment::Center);
 
         let console = column![
+            solo_banner,
+            Space::with_height(8),
             hw_label,
             Space::with_height(6),
             hw,
@@ -725,9 +773,9 @@ impl App {
     }
 
     fn log(&self) -> Element<Message> {
-        let Some(state) = &self.state else {
+        if self.state.is_none() {
             return container(text("waiting for daemon…").color(theme::TEXT_DIM)).padding(40).into();
-        };
-        widgets::log_view(state)
+        }
+        widgets::log_view(&self.log_editor)
     }
 }

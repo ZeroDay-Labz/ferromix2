@@ -115,6 +115,16 @@ pub struct Strip {
     pub kind: Option<SourceKind>,
     pub volume: f32,
     pub mute: bool,
+    /// PFL solo. When any strip in the mix is soloed, every *non*-soloed
+    /// strip's bus sends are cut (same treatment `mute` gets) while soloed
+    /// strips play normally through their own mute/assign state — mute
+    /// always wins over solo. Deliberately not persisted to `config.toml`
+    /// (see `StripCfg`, which has no `solo` field): it's a momentary
+    /// monitoring state, not a routing preference, and persisting it risks a
+    /// "why is everything silent" surprise on the next launch if it was left
+    /// on.
+    #[serde(default)]
+    pub solo: bool,
     pub level: Level,
     pub assign: Vec<bool>,
     #[serde(default)]
@@ -198,6 +208,7 @@ impl Strip {
             kind: None,
             volume: UNITY_POS,
             mute: false,
+            solo: false,
             level: Level::default(),
             assign: vec![false; n_buses],
             recording: false,
@@ -304,6 +315,9 @@ pub struct MixerState {
     /// doc comment. Mirrored here so the Settings picker can show which rate
     /// is currently active.
     pub sample_rate: u32,
+    /// The PipeWire graph's forced quantum (buffer size, in samples) — see
+    /// `Config.quantum`'s doc comment. `0` = auto/unforced.
+    pub quantum: u32,
     /// Master bypass state — see `Config.enabled`'s doc comment. Drives the
     /// header's LIVE/OFF indicator independent of `connected` (the socket
     /// can be fine while FerroMix is deliberately not routing anything).
