@@ -320,10 +320,27 @@ fn knob<'a>(label: &'a str, value: f32, on: bool, accent: Color, strip: usize, d
         .width(Length::Fixed(48.0))
         .height(Length::Fixed(48.0));
     let toggle = { let ndsp = if is_gate { StripDsp { gate_on: !dsp.gate_on, ..dsp } } else { StripDsp { comp_on: !dsp.comp_on, ..dsp } }; Message::Send(Command::SetStripDsp { strip, dsp: ndsp }) };
+    // What this knob actually does to the audio, in the same units the
+    // filter-chain module receives (see `dsp.rs`'s doc comment and
+    // `StripDsp::gate_threshold_db`/`comp_ratio`) — a bare rotary position
+    // with no number told the user nothing about where it was actually set,
+    // which is exactly what made "is the gate/comp set correctly" a question
+    // you could only answer by ear. Shown dimmed (not hidden) while off, so
+    // you can see where a knob would land before switching it on.
+    let readout = if is_gate {
+        format!("{:.0}dB", dsp.gate_threshold_db())
+    } else {
+        format!("{:.1}:1", dsp.comp_ratio())
+    };
+    let readout_text = text(readout)
+        .size(tokens::type_scale::MICRO)
+        .color(if on { theme::TEXT_DIM } else { theme::EDGE })
+        .center()
+        .width(Length::Fixed(48.0));
     let lbl = button(text(label).size(tokens::type_scale::CAPTION).color(if on { accent } else { theme::TEXT_DIM }).center().width(Length::Fill))
         .style(move |_t, s| button::Style { background: Some(accent_fill(if on { accent.scale_alpha(0.15) } else { theme::SEG_OFF }, s)), border: Border { color: if on { accent } else { theme::EDGE }, width: 1.0, radius: tokens::radius::SM.into() }, text_color: if on { accent } else { theme::TEXT_DIM }, ..Default::default() })
         .width(Length::Fixed(48.0)).padding([2, 0]).on_press(toggle);
-    column![dial, lbl].spacing(3).align_x(Alignment::Center).into()
+    column![dial, readout_text, lbl].spacing(2).align_x(Alignment::Center).into()
 }
 
 /// Interactive DSP knob. Click+drag vertically to set the amount, scroll to

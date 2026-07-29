@@ -588,10 +588,12 @@ impl App {
         };
 
         // Hardware-out row: A1/A2/A3 device slots across the top. Label sits
-        // above (matching the INPUT STRIPS/VIRTUAL MICS label pattern below)
-        // and the slot row itself is centered in the available width instead
-        // of clumping left — on a wide window 2-3 fixed-width slots left no
-        // other cue that they weren't meant to fill the row.
+        // above (matching the INPUT STRIPS/VIRTUAL MICS label pattern below).
+        // Left-aligned, matching every other section's label/content
+        // alignment (INPUT STRIPS, VIRTUAL MICS) instead of being the one
+        // centered element on the page — centering read as visually
+        // disconnected from its own "HARDWARE OUT" label sitting flush left
+        // above it.
         let hw_label = text("HARDWARE OUT").size(tokens::type_scale::LABEL).color(theme::TEXT_DIM);
         let mut hw_slots = row![].spacing(10);
         for (i, b) in state.buses.iter().enumerate() {
@@ -599,7 +601,7 @@ impl App {
                 hw_slots = hw_slots.push(widgets::hw_out_slot(i, b, state));
             }
         }
-        let hw = container(hw_slots).width(Length::Fill).center_x(Length::Fill);
+        let hw = container(hw_slots).width(Length::Fill);
 
         let card_w = self.strip_card_width();
         let renaming_strip = |idx: usize| match &self.renaming {

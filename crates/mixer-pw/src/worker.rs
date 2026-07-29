@@ -1437,10 +1437,39 @@ fn reconcile(ctx: &Ctx) {
             }
         }
         st.stray_dest_first_seen.retain(|k, _| current_stray.contains(k));
+        // Strip node ids whose strip is currently muted — confirmed live that
+        // on a Fedora pipewire-pulse setup, WirePlumber's role-based routing
+        // doesn't just steal an app's stream once at startup; it can keep
+        // re-linking it straight to the real hardware sink every few seconds
+        // indefinitely, bypassing FerroMix's strip/bus nodes (and therefore
+        // their mute/volume) entirely each time it wins that window. The
+        // 250ms grace period below exists to avoid re-triggering a genuine
+        // destroy/recreate war (see its own comment) — a fair trade for
+        // AUDIBLE content, where an instant cut just races WirePlumber's own
+        // instant retry. But there's no such trade-off once the strip is
+        // muted: the user has explicitly asked for silence, so losing that
+        // 250ms window every single recreation is a real, repeating audio
+        // leak, not a cosmetic flicker. Muted strips skip the grace period
+        // entirely and get cut on sight.
+        let muted_strip_nodes: HashSet<NodeId> = st
+            .desired
+            .strip_mute
+            .iter()
+            .filter(|(_, &muted)| muted)
+            .filter_map(|(idx, _)| st.strip_nodes.get(idx).map(|(id, _)| *id))
+            .collect();
         for key @ (node, other) in current_stray {
+            let strip_muted = legit_by_src
+                .get(&node)
+                .is_some_and(|strips| strips.iter().any(|s| muted_strip_nodes.contains(s)));
             let first = *st.stray_dest_first_seen.entry(key).or_insert_with(Instant::now);
-            if first.elapsed() >= Duration::from_millis(250) {
-                log::info!("REDIRECT {} off {} (now exclusively on FerroMix)", nname(st, node), nname(st, other));
+            if strip_muted || first.elapsed() >= Duration::from_millis(250) {
+                log::info!(
+                    "REDIRECT {} off {} ({})",
+                    nname(st, node),
+                    nname(st, other),
+                    if strip_muted { "muted — cut immediately" } else { "now exclusively on FerroMix" }
+                );
                 remove_links_between(ctx, st, node, other);
                 st.stray_dest_first_seen.remove(&key);
             }
