@@ -30,7 +30,7 @@ jobs:
       is_release: ${{ steps.v.outputs.is_release }}
       prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: v
         run: |
           set -euo pipefail
@@ -64,7 +64,7 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -84,7 +84,7 @@ jobs:
           install -Dm644 LICENSE "$DIR/LICENSE"
           install -Dm644 README.md "$DIR/README.md"
           tar -czf "${DIR}.tar.gz" "$DIR"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: tarball
           path: ferromix2-*-x86_64-linux.tar.gz
@@ -94,7 +94,7 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -104,7 +104,7 @@ jobs:
         run: cargo install cargo-deb --locked
       - name: Build .deb
         run: cargo deb -p mixer-gui-iced --locked
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: deb
           path: target/debian/*.deb
@@ -126,7 +126,7 @@ jobs:
       # not a git repository").
       - name: Install git
         run: dnf install -y git
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install remaining build dependencies
         run: |
           dnf install -y rpm-build rpmdevtools rust cargo clang-devel pkgconf-pkg-config pipewire-devel
@@ -150,7 +150,7 @@ jobs:
           rpmbuild -ba "$HOME/rpmbuild/SPECS/ferromix2.spec"
           mkdir -p dist
           cp "$HOME"/rpmbuild/RPMS/*/*.rpm dist/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rpm
           path: dist/*.rpm
@@ -159,13 +159,16 @@ jobs:
   flatpak:
     needs: version
     runs-on: ubuntu-latest
-    # See packaging/flatpak/io.github.zerodaylabz.FerroMix2.yml's header
-    # comment: this pipeline is new and unverified. Failing here must not
-    # take down the RPM/tar.gz release those don't depend on it — see the
-    # `release` job's `fail_on_unmatched_files: false` below.
+    # Builds and completes cleanly as of the --filesystem=xdg-run/pipewire-0
+    # fix (see packaging/flatpak/io.github.zerodaylabz.FerroMix2.yml's header
+    # comment) but hasn't been confirmed to actually run correctly as an
+    # installed bundle on real hardware yet. Staying continue-on-error so a
+    # regression here still can't take down the RPM/tar.gz/deb release those
+    # don't depend on it — see the `release` job's
+    # `fail_on_unmatched_files: false` below.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install flatpak-builder + runtimes
         run: |
           set -euo pipefail
@@ -197,7 +200,7 @@ jobs:
           flatpak-builder --user --force-clean --repo=repo build-dir \
             packaging/flatpak/io.github.zerodaylabz.FerroMix2.yml
           flatpak build-bundle repo "ferromix2-${VERSION}.flatpak" io.github.zerodaylabz.FerroMix2
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: flatpak
           path: ferromix2-*.flatpak
@@ -211,7 +214,7 @@ jobs:
     if: needs.version.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
       - name: Create GitHub Release
