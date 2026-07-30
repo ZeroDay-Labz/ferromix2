@@ -1,11 +1,13 @@
 # Flatpak manifest for FerroMix2.
 #
 # NOTE for maintainers: this manifest is new and, unlike the RPM/tar.gz
-# packaging, has not yet been confirmed to produce a working build — it was
-# written against documented flatpak-builder/PipeWire/cargo conventions but
-# needs a real CI run (see .github/workflows/release.yml's `flatpak` job) to
-# prove out. The most likely failure points if it doesn't build clean on the
-# first try: the `pipewire` module's meson `config-opts` (option names/
+# packaging, has not yet produced a working *bundle* end-to-end (untested on
+# real hardware) — but as of the v3.1.0-alpha.1 CI run it does build and
+# finish cleanly (module builds, appstream compose, and `flatpak
+# build-finish` all succeeded; see git blame on the
+# `--filesystem=xdg-run/pipewire-0` line for the bug that blocked
+# build-finish for four releases). If it breaks again the two next most
+# likely spots are the `pipewire` module's meson `config-opts` (option names/
 # defaults drift between PipeWire releases) and the pinned `tag:` below going
 # stale. Check the Actions log and adjust those two spots first.
 #
@@ -16,8 +18,9 @@
 # minimal client-only PipeWire here (no ALSA/PulseAudio/JACK compat, no
 # session manager, no server-side extras) gives us those headers without
 # depending on undocumented runtime internals. At *runtime* the sandboxed app
-# still talks to the HOST's already-running PipeWire server over
-# `--socket=pipewire` — it never starts a server of its own.
+# still talks to the HOST's already-running PipeWire server by way of the
+# `xdg-run/pipewire-0` filesystem grant below — it never starts a server of
+# its own.
 id: io.github.zerodaylabz.FerroMix2
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'
@@ -39,8 +42,15 @@ finish-args:
   - --share=ipc
   # GPU access for iced's wgpu renderer.
   - --device=dri
-  # The actual audio graph — talks to the HOST's PipeWire server.
-  - --socket=pipewire
+  # The actual audio graph — talks to the HOST's PipeWire server. There is
+  # no such thing as `--socket=pipewire`: that was tried first and fails on
+  # every flatpak version, including 1.16.6 (confirmed live — the error
+  # message itself enumerates the valid socket types and "pipewire" has
+  # never been one of them; upgrading flatpak via the PPA below didn't fix
+  # it because it was never a stale-version problem). PipeWire access is
+  # instead granted the same way OBS Studio/EasyEffects do it on Flathub:
+  # expose the actual socket file the client library connects to.
+  - --filesystem=xdg-run/pipewire-0
   # RESET AUDIO / sample-rate change restart PipeWire+WirePlumber via
   # `systemctl --user` on the host; `mixer_core::engine::host_command`
   # detects the sandbox and routes this through `flatpak-spawn --host`,

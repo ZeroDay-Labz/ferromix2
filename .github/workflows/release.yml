@@ -169,11 +169,17 @@ jobs:
       - name: Install flatpak-builder + runtimes
         run: |
           set -euo pipefail
-          # ubuntu-latest's default apt repos ship a flatpak too old to know
-          # about the `pipewire` socket type in finish-args (confirmed live:
+          # ubuntu-latest's stock flatpak was too old to know the
+          # `pipewire` socket type in finish-args (confirmed live:
           # "Unknown socket type pipewire, valid types are: x11, wayland,
-          # pulseaudio, ..." — no pipewire in that list). The flatpak project's
-          # own PPA tracks current upstream releases.
+          # pulseaudio, ..."), which is what led here originally — but that
+          # diagnosis turned out to be wrong: `--socket=pipewire` isn't a
+          # real socket type on ANY flatpak version, including 1.16.6 from
+          # this same PPA (same error, same missing entry in that same
+          # list). The actual fix is in the manifest itself, see its
+          # comment on `--filesystem=xdg-run/pipewire-0`. Keeping this PPA
+          # anyway since a current flatpak/flatpak-builder is just better
+          # to build against than ubuntu-latest's stock (older) one.
           sudo add-apt-repository -y ppa:flatpak/stable
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder
