@@ -370,41 +370,26 @@ impl Dial {
 }
 
 /// (anchor_y_at_press, anchor_value_at_press) for the drag-distance math (see
-/// the big comment on `update()`), plus `live` — the value the knob is
-/// CURRENTLY showing while a drag is in progress, updated on every
-/// `CursorMoved` for a smooth-looking drag, but deliberately NOT sent to the
-/// backend until release. `Command::SetStripDsp` triggers a full PipeWire
-/// filter-chain module destroy+reload (see `dsp.rs`) — genuinely disruptive,
-/// audibly cutting that strip for a moment. Emitting it on every mouse-move
-/// sample during a drag (tens of times a second) turned a single knob drag
-/// into a rapid-fire storm of real module teardown/rebuild cycles, which is
-/// what "touching the GUI kills all audio" traced back to. Committing once,
-/// on release, keeps the knob visually responsive (via `live`) without ever
-/// re-loading the module more than once per gesture.
+/// the comment on `update()`). Used to hold `Command::SetStripDsp` to
+/// commit-on-release only, back when every commit meant a full PipeWire
+/// filter-chain module destroy+reload (audibly cutting that strip for a
+/// moment) — `dsp::push_live_params` (see dsp.rs) now updates an
+/// already-loaded module's controls in place instead, so a knob drag/scroll
+/// is exactly as cheap as the volume fader's `SetStripVolume` and emits live
+/// on every event, no throttling or release-only commit needed any more.
 struct DialState {
     drag: Option<(f32, f32)>,
-    live: Option<f32>,
     tick_cache: canvas::Cache,
     dynamic_cache: canvas::Cache,
     last_dynamic: std::cell::Cell<Option<(f32, bool)>>,
-    /// Rate-limits `WheelScrolled` commits — that handler used to call
-    /// `emit()` directly on every scroll tick, completely bypassing the
-    /// commit-on-release mechanism above. A continuous scroll (trackpad, or
-    /// a fast wheel) reproduced the exact reload storm the drag fix
-    /// eliminated. `state.live` still updates on every tick (so the knob
-    /// visually tracks the scroll immediately), but the actual backend
-    /// commit — the expensive one — is capped to roughly once per 150ms.
-    last_wheel_emit: Option<std::time::Instant>,
 }
 impl Default for DialState {
     fn default() -> Self {
         Self {
             drag: None,
-            live: None,
             tick_cache: canvas::Cache::default(),
             dynamic_cache: canvas::Cache::default(),
             last_dynamic: std::cell::Cell::new(None),
-            last_wheel_emit: None,
         }
     }
 }
@@ -419,7 +404,6 @@ impl canvas::Program<Message> for Dial {
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(Button::Left)) if inside => {
                 state.drag = cursor.position().map(|p| (p.y, self.value));
-                state.live = Some(self.value);
                 (event::Status::Captured, None)
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
@@ -427,34 +411,19 @@ impl canvas::Program<Message> for Dial {
                     // Drag up = increase. 120px of travel = full range,
                     // measured from the press point, not the last event.
                     let delta = (anchor_y - pos.y) / 120.0;
-                    state.live = Some((anchor_value + delta).clamp(0.0, 1.0));
-                    // No message here — see DialState's doc comment. The
-                    // ~60Hz UI redraw tick already picks up `state.live` on
-                    // the next frame, so the knob still tracks the cursor
-                    // smoothly; only the expensive backend commit waits.
-                    return (event::Status::Captured, None);
+                    let nv = (anchor_value + delta).clamp(0.0, 1.0);
+                    return (event::Status::Captured, Some(self.emit(nv)));
                 }
                 (event::Status::Ignored, None)
             }
             Event::Mouse(mouse::Event::ButtonReleased(Button::Left)) => {
-                let msg = state.live.take().map(|nv| self.emit(nv));
                 state.drag = None;
-                (event::Status::Captured, msg)
+                (event::Status::Captured, None)
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if inside => {
                 let dy = match delta { mouse::ScrollDelta::Lines { y, .. } => y, mouse::ScrollDelta::Pixels { y, .. } => y / 40.0 };
                 let nv = (self.value + dy * 0.05).clamp(0.0, 1.0);
-                state.live = Some(nv);
-                const MIN_WHEEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
-                let should_emit = state.last_wheel_emit.map_or(true, |t| t.elapsed() > MIN_WHEEL_INTERVAL);
-                if should_emit {
-                    state.last_wheel_emit = Some(std::time::Instant::now());
-                    (event::Status::Captured, Some(self.emit(nv)))
-                } else {
-                    // Visual already updated via `state.live` above; skip
-                    // the expensive backend commit for this tick.
-                    (event::Status::Captured, None)
-                }
+                (event::Status::Captured, Some(self.emit(nv)))
             }
             Event::Mouse(mouse::Event::ButtonPressed(Button::Right)) if inside => {
                 // Right-click resets to default amount.
@@ -470,7 +439,7 @@ impl canvas::Program<Message> for Dial {
         let rad = b.width / 2.0 - 6.0;
         let start = PI * 0.75;
         let sweep = PI * 1.5;
-        let display_value = s.live.unwrap_or(self.value);
+        let display_value = self.value;
 
         // Tick marks: purely a function of the widget's size, never of value
         // or on/off state — cached once, redrawn only if the size changes.

@@ -35,12 +35,21 @@
 //! The module presents an `Audio/Sink` (capture side, we write into) and an
 //! `Audio/Source` (playback side, we read out), passive so WirePlumber leaves
 //! the auto-routing to us. Control values are baked into the module's SPA-JSON
-//! args at load time; a knob change reloads the module (destroy + recreate)
-//! rather than reaching into the running filter-chain's internal nodes to push
-//! new params live. A reload is a few milliseconds of dropout on that one
-//! strip — an acceptable trade for not needing to discover/bind the internal
-//! `gate_l`/`gate_r`/`comp` nodes the module creates, which would need
-//! reverse-engineering filter-chain's internal naming convention.
+//! args at load time for the FIRST load of a strip's module; every knob move
+//! or GATE/COMP toggle after that goes through `push_live_params` instead,
+//! which reaches into the already-running filter-chain and updates control
+//! values in place — no destroy/recreate, no dropout. This works because the
+//! chain's topology never changes between on/off states (see
+//! `filter_chain_args`'s doc comment: "off" is neutral control values, not a
+//! different graph), so a value-only update is always valid against whatever
+//! generation of the module is currently loaded. Confirmed against pipewire
+//! 1.2.7's actual module-filter-chain.c source (not just its man page): the
+//! module's capture-side stream applies an incoming `SPA_PARAM_Props` whose
+//! `params` property is a flat "name", value, "name", value struct, resolved
+//! through the exact same `find_port`-style "<node>:<control>" syntax used to
+//! build the SPA-JSON below — meaning the `gate_l`/`gate_r`/`comp` node names
+//! chosen there double as the live-update addressing scheme, no separate
+//! discovery step needed.
 //!
 //! Future direction (not built yet): the fixed gate→compressor chain here is
 //! a special case of a more general capability — `filter.graph`'s `nodes`
@@ -117,6 +126,31 @@ fn db_to_lin(db: f32) -> f32 {
     10f32.powf(db / 20.0)
 }
 
+/// Gate open/close thresholds in the noisegate's native units (linear
+/// amplitude, see `db_to_lin`) for the current knob position/on-off state.
+/// Shared by the initial `filter_chain_args` SPA-JSON and `live_props_pod`'s
+/// live-update pod so the two paths can never silently diverge on what a
+/// given `StripDsp` actually means to the running plugin.
+fn gate_thresholds_lin(dsp: &StripDsp) -> (f32, f32) {
+    let (open_db, close_db) = if dsp.gate_on {
+        let t = dsp.gate_threshold_db();
+        (t, t - 6.0) // hysteresis: close 6 dB below open
+    } else {
+        (-90.0, -95.0) // effectively always open
+    };
+    (db_to_lin(open_db), db_to_lin(close_db))
+}
+
+/// Compressor threshold (dB) / ratio for the current knob position/on-off
+/// state — see `gate_thresholds_lin`'s doc comment, same sharing rationale.
+fn comp_params(dsp: &StripDsp) -> (f32, f32) {
+    if dsp.comp_on {
+        (dsp.comp_threshold_db(), dsp.comp_ratio())
+    } else {
+        (0.0, 1.0) // 1:1 = no compression
+    }
+}
+
 /// Build the `args` string for `libpipewire-module-filter-chain` for one strip.
 ///
 /// This is the SPA-JSON the module parses. Returns a string that can be passed
@@ -125,20 +159,8 @@ fn db_to_lin(db: f32) -> f32 {
 /// it never closes, compressor ratio 1:1) so the chain topology never changes
 /// at runtime — only control values do, which is cheap and glitch-free.
 pub fn filter_chain_args(idx: usize, dsp: &StripDsp) -> String {
-    let (gate_open_db, gate_close_db) = if dsp.gate_on {
-        let t = dsp.gate_threshold_db();
-        (t, t - 6.0) // hysteresis: close 6 dB below open
-    } else {
-        (-90.0, -95.0) // effectively always open
-    };
-    let gate_open = db_to_lin(gate_open_db);
-    let gate_close = db_to_lin(gate_close_db);
-
-    let (comp_thresh, comp_ratio) = if dsp.comp_on {
-        (dsp.comp_threshold_db(), dsp.comp_ratio())
-    } else {
-        (0.0, 1.0) // 1:1 = no compression
-    };
+    let (gate_open, gate_close) = gate_thresholds_lin(dsp);
+    let (comp_thresh, comp_ratio) = comp_params(dsp);
 
     let input = dsp_input_name(idx);
     let output = dsp_output_name(idx);
@@ -212,6 +234,64 @@ pub fn filter_chain_args(idx: usize, dsp: &StripDsp) -> String {
     )
 }
 
+/// Build the `SPA_PARAM_Props` pod bytes for a live control update — pure
+/// and independently testable from the actual `node.set_param` call in
+/// `push_live_params` below. The `params` property's value is a flat Struct
+/// of alternating "<node>:<control>" name strings and float values (NOT a
+/// SPA array — a heterogeneous struct, matching module-filter-chain.c's
+/// `parse_params()`, which walks it with alternating
+/// `spa_pod_parser_get_string`/`get_float` calls). Every control this DSP
+/// chain has is included on every call, on or off — cheaper to always send
+/// the full set than to track which control actually changed, and this
+/// runs at most once per user gesture (see widgets.rs's `DialState`), not
+/// per audio buffer.
+fn live_props_pod(dsp: &StripDsp) -> Result<Vec<u8>, String> {
+    use pw::spa::pod::{serialize::PodSerializer, Object, Property, PropertyFlags, Value};
+    let (gate_open, gate_close) = gate_thresholds_lin(dsp);
+    let (comp_thresh, comp_ratio) = comp_params(dsp);
+    let params = Value::Struct(vec![
+        Value::String("gate_l:Open Threshold".into()),
+        Value::Float(gate_open),
+        Value::String("gate_l:Close Threshold".into()),
+        Value::Float(gate_close),
+        Value::String("gate_r:Open Threshold".into()),
+        Value::Float(gate_open),
+        Value::String("gate_r:Close Threshold".into()),
+        Value::Float(gate_close),
+        Value::String("comp:Threshold level (dB)".into()),
+        Value::Float(comp_thresh),
+        Value::String("comp:Ratio (1:n)".into()),
+        Value::Float(comp_ratio),
+    ]);
+    let obj = Object {
+        type_: pw::spa::sys::SPA_TYPE_OBJECT_Props,
+        id: pw::spa::sys::SPA_PARAM_Props,
+        properties: vec![Property {
+            key: pw::spa::sys::SPA_PROP_params,
+            flags: PropertyFlags::empty(),
+            value: params,
+        }],
+    };
+    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &Value::Object(obj))
+        .map(|(cursor, _)| cursor.into_inner())
+        .map_err(|e| format!("pod serialize: {e:?}"))
+}
+
+/// Push new gate/compressor control values into an ALREADY-LOADED strip's
+/// filter-chain module without destroying/reloading it — see this module's
+/// doc comment for why that's safe (topology never changes) and how PipeWire
+/// resolves the addressing. `node` must be the bound proxy for that strip's
+/// `dsp_input_name` node (the module's capture-side `Audio/Sink`, which is
+/// where module-filter-chain.c's live-Props handling is wired) — the caller
+/// (`worker.rs`) is responsible for only calling this once that node has
+/// actually shown up in the registry and been bound.
+pub fn push_live_params(node: &pw::node::Node, dsp: &StripDsp) -> Result<(), String> {
+    let bytes = live_props_pod(dsp)?;
+    let pod = pw::spa::pod::Pod::from_bytes(&bytes).ok_or("pod from_bytes failed")?;
+    node.set_param(pw::spa::param::ParamType::Props, 0, pod);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +336,62 @@ mod tests {
         // node names carry the strip index
         assert!(args.contains("ferromix.dsp.2.in"));
         assert!(args.contains("ferromix.dsp.2.out"));
+    }
+
+    #[test]
+    fn live_props_pod_round_trips_to_the_same_values_as_initial_load() {
+        // The live-update path and the initial SPA-JSON load path must never
+        // disagree on what a given StripDsp means — they're read by the SAME
+        // C-side control resolution (module-filter-chain.c's find_port
+        // "node:control" syntax), just delivered two different ways. Parse
+        // the live pod back and check its (name, value) pairs against the
+        // same dsp.rs helpers `filter_chain_args` uses.
+        use pw::spa::pod::deserialize::PodDeserializer;
+        use pw::spa::pod::Value;
+
+        for dsp in [
+            StripDsp { gate_on: true, gate: 0.3, comp_on: true, comp: 0.7 },
+            StripDsp { gate_on: false, gate: 0.9, comp_on: false, comp: 0.1 },
+        ] {
+            let bytes = live_props_pod(&dsp).expect("serialize");
+            let (_, value) = PodDeserializer::deserialize_from::<Value>(&bytes).expect("deserialize");
+            let Value::Object(obj) = value else { panic!("expected an Object pod") };
+            assert_eq!(obj.type_, pw::spa::sys::SPA_TYPE_OBJECT_Props);
+            assert_eq!(obj.id, pw::spa::sys::SPA_PARAM_Props);
+            let params_prop = obj
+                .properties
+                .iter()
+                .find(|p| p.key == pw::spa::sys::SPA_PROP_params)
+                .expect("params property present");
+            let Value::Struct(fields) = &params_prop.value else { panic!("params value should be a Struct") };
+
+            let get = |name: &str| -> f32 {
+                let i = fields
+                    .iter()
+                    .position(|v| matches!(v, Value::String(s) if s == name))
+                    .unwrap_or_else(|| panic!("{name} not found in {fields:?}"));
+                match &fields[i + 1] {
+                    Value::Float(f) => *f,
+                    other => panic!("expected float after {name}, got {other:?}"),
+                }
+            };
+
+            let (gate_open, gate_close) = gate_thresholds_lin(&dsp);
+            let (comp_thresh, comp_ratio) = comp_params(&dsp);
+            assert_eq!(get("gate_l:Open Threshold"), gate_open);
+            assert_eq!(get("gate_l:Close Threshold"), gate_close);
+            assert_eq!(get("gate_r:Open Threshold"), gate_open);
+            assert_eq!(get("gate_r:Close Threshold"), gate_close);
+            assert_eq!(get("comp:Threshold level (dB)"), comp_thresh);
+            assert_eq!(get("comp:Ratio (1:n)"), comp_ratio);
+
+            // Cross-check against the initial-load SPA-JSON's own numbers too
+            // (belt and suspenders — this is the exact regression the shared
+            // helpers exist to prevent).
+            let args = filter_chain_args(3, &dsp);
+            assert!(args.contains(&format!("\"Open Threshold\" = {gate_open}")));
+            assert!(args.contains(&format!("\"Threshold level (dB)\" = {comp_thresh}")));
+        }
     }
 
     #[test]

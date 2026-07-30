@@ -2004,6 +2004,43 @@ fn handle_cmd(ctx: &Ctx, cmd: PwCmd) {
             }
         }
         PwCmd::SetStripDsp { idx, dsp } => {
+            // Once a strip's filter-chain module is already loaded, a knob
+            // move or GATE/COMP toggle is JUST a control-value change on its
+            // existing graph — the topology never differs between on/off
+            // states (see `filter_chain_args`'s doc comment: "off" bakes in
+            // neutral values, not a different graph) — so push it live via
+            // `dsp::push_live_params` instead of destroying and reloading
+            // the module. No dropout, no relinking, no node/port/link churn
+            // at all. See dsp.rs's module doc comment for how this is
+            // actually wired against pipewire's own module-filter-chain.c.
+            // Only fall back to a full reload if there's no module for this
+            // strip yet (first touch) or the live push itself fails (e.g. a
+            // registry race where `dsp_modules` says loaded but the
+            // capture-side node hasn't been bound yet).
+            let live_target = {
+                let st = ctx.st.borrow();
+                if st.dsp_modules.contains_key(&idx) {
+                    st.dsp_nodes.get(&idx).and_then(|(in_id, _)| *in_id).and_then(|id| st.bound.get(&id))
+                        .map(|node| dsp::push_live_params(node, &dsp))
+                } else {
+                    None
+                }
+            };
+            match live_target {
+                Some(Ok(())) => {
+                    ctx.log(format!(
+                        "DSP strip {} — gate {} / comp {}",
+                        idx + 1,
+                        if dsp.gate_on { "on" } else { "off" },
+                        if dsp.comp_on { "on" } else { "off" }
+                    ));
+                    return;
+                }
+                Some(Err(e)) => {
+                    ctx.log(format!("DSP live update FAILED for strip {} ({e}) — reloading module", idx + 1));
+                }
+                None => {}
+            }
             // Tear down the OLD module (if any) and its slot links BEFORE
             // loading the new one — previously the new module was loaded
             // first and the old one only got dropped as a side effect of

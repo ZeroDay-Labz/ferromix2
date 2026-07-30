@@ -6,7 +6,7 @@ Name:           ferromix2
 # that builds this (.github/workflows/release.yml's `rpm` job) both derive
 # the same split from the git tag — keep them in sync if this changes.
 Version:        3.1.0
-Release:        0.1.alpha1%{?dist}
+Release:        0.2.alpha2%{?dist}
 Summary:        Voicemeeter-style virtual audio mixer for PipeWire
 
 License:        MIT
@@ -66,6 +66,27 @@ install -Dm644 assets/%{name}.svg %{buildroot}%{_datadir}/icons/hicolor/scalable
 %{_datadir}/icons/hicolor/scalable/apps/%{name}.svg
 
 %changelog
+* Thu Jul 30 2026 FerroMix contributors <noreply@example.com> - 3.1.0-0.2.alpha2
+- DSP gate/compressor knobs are now genuinely live: turning one no longer
+  destroys and reloads the strip's PipeWire filter-chain module (a real,
+  audible dropout on that strip every time). Confirmed against pipewire
+  1.2.7's own module-filter-chain.c source that its capture-side node
+  accepts control-value updates live via a standard SPA_PARAM_Props pod
+  addressed by the same "gate_l"/"gate_r"/"comp" node names already used
+  to build the module — the same mechanism `pw-cli s <id> Props '...'`
+  uses from outside our process, not a new/undocumented trick. Knobs now
+  emit on every drag/scroll event exactly like the volume faders already
+  did (which were always live — SetStripVolume was never the slow path),
+  instead of only committing once on mouse-release.
+- Fixed the Flatpak release job, broken across all four prior release
+  builds: `--socket=pipewire` was never a real Flatpak socket type on ANY
+  flatpak version (the earlier "upgrade flatpak via a PPA" fix addressed
+  the wrong theory — same error on 1.16.6 as on the stock version).
+  PipeWire access is granted via --filesystem=xdg-run/pipewire-0 instead,
+  the same mechanism OBS Studio/EasyEffects use on Flathub.
+- CI: bumped actions/checkout, actions/upload-artifact, and
+  actions/download-artifact off Node.js 20 (GitHub Actions was forcibly
+  running them on Node 24 anyway and flagging every job).
 * Wed Jul 29 2026 FerroMix contributors <noreply@example.com> - 3.1.0-0.1.alpha1
 - First alpha-tagged release (still genuinely alpha-quality software —
   GitHub Release is marked pre-release accordingly).
